@@ -103,9 +103,9 @@ def get_token_gradients(
         Lower (more negative) values indicate tokens that would *decrease*
         the loss most if substituted in.
     """
-    device = next(model.parameters()).device
     embed_layer = model.get_input_embeddings()          # nn.Embedding
     embed_weights = embed_layer.weight                  # (vocab_size, d_model)
+    device = embed_weights.device
 
     input_ids = token_slices.input_ids.to(device)       # (seq_len,)
 
@@ -154,7 +154,7 @@ def get_token_gradients(
     token_gradients = one_hot.grad.clone()               # (suffix_len, vocab_size)
 
     # Clean up the computation graph.
-    model.zero_grad()
+    model.zero_grad(set_to_none=True)
 
     return token_gradients
 
@@ -194,27 +194,23 @@ def sample_candidates(
     candidates : Tensor (n_candidates, seq_len)
         Each row is a full token sequence with exactly one suffix token swapped.
     """
+    device = token_gradients.device
     suffix_len = token_gradients.shape[0]
 
-    # For each suffix position, find the top_k tokens with the LOWEST gradient
+    # For each suffix position, find top_k tokens with LOWEST gradient
     # (steepest descent direction).
-    # torch.topk with largest=False gives the smallest values.
     top_k_ids = (-token_gradients).topk(top_k, dim=1).indices  # (suffix_len, top_k)
 
-    # Tile the current sequence into (n_candidates, seq_len).
-    candidates = current_ids.unsqueeze(0).repeat(n_candidates, 1)
+    # Tile the current sequence on device into (n_candidates, seq_len).
+    candidates = current_ids.to(device).unsqueeze(0).repeat(n_candidates, 1)
 
-    # For each candidate, pick a random suffix position and a random top-k token.
-    random_positions = torch.randint(0, suffix_len, (n_candidates,))
-    random_top_k_idx = torch.randint(0, top_k, (n_candidates,))
+    # Pick a random suffix position and top-k replacement token for each candidate.
+    rand_pos = torch.randint(0, suffix_len, (n_candidates,), device=device)
+    rand_k = torch.randint(0, top_k, (n_candidates,), device=device)
+    replacements = top_k_ids[rand_pos, rand_k]
 
-    # Gather the replacement token ids.
-    replacement_tokens = top_k_ids[random_positions, random_top_k_idx]
-
-    # Write replacements into the candidate sequences.
-    absolute_positions = random_positions + suffix_slice.start
-    candidates[torch.arange(n_candidates), absolute_positions] = replacement_tokens
-
+    # Mutate selected positions in-place.
+    candidates[torch.arange(n_candidates, device=device), rand_pos + suffix_slice.start] = replacements
     return candidates
 
 
@@ -262,16 +258,10 @@ def evaluate_candidates(
         # Slice out the logits that predict target tokens.
         loss_logits = logits[:, token_slices.loss_slice, :]  # (B, target_len, vocab)
 
-        # Compute per-candidate cross-entropy loss.
-        # Reshape for F.cross_entropy: (B * target_len, vocab) vs (B * target_len,)
-        B, T, V = loss_logits.shape
-        flat_logits = loss_logits.reshape(B * T, V)
-        flat_targets = target_ids.unsqueeze(0).expand(B, -1).reshape(B * T)
-        per_token_loss = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        per_candidate_loss = per_token_loss.view(B, T).mean(dim=1)  # (B,)
-
-        all_losses.append(per_candidate_loss)
-
+        # Mean cross-entropy loss over target tokens per candidate.
+        targets = target_ids.unsqueeze(0).expand(batch_ids.size(0), -1)
+        loss = F.cross_entropy(loss_logits.transpose(1, 2), targets, reduction="none").mean(dim=1)
+        all_losses.append(loss)
     all_losses = torch.cat(all_losses)                      # (n_candidates,)
     best_idx = all_losses.argmin().item()
     best_loss = all_losses[best_idx].item()
@@ -303,6 +293,10 @@ class GCGAttack:
         self.top_k = top_k
         self.n_candidates = n_candidates
         self.batch_size = batch_size
+
+        # Freeze model weights so backward only computes gradients for input tokens.
+        for p in self.model.parameters():
+            p.requires_grad = False
 
     # ---- helpers -----------------------------------------------------------
 
@@ -341,6 +335,28 @@ class GCGAttack:
         return success, generated
 
     # ---- public API --------------------------------------------------------
+    def step(
+        self,
+        prompt: str,
+        suffix: str,
+        target: str,
+    ) -> Tuple[str, float]:
+        """Execute one GCG iteration and return ``(updated_suffix, best_loss)``."""
+        ts = find_token_slices(prompt, suffix, target, self.tokenizer)
+        token_grads = get_token_gradients(self.model, ts)
+        candidates = sample_candidates(
+            current_ids=ts.input_ids,
+            token_gradients=token_grads,
+            suffix_slice=ts.suffix_slice,
+            top_k=self.top_k,
+            n_candidates=self.n_candidates,
+        )
+        best_idx, best_loss = evaluate_candidates(
+            self.model, candidates, ts, batch_size=self.batch_size,
+        )
+        suffix_ids = candidates[best_idx, ts.suffix_slice]
+        new_suffix = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
+        return new_suffix, best_loss
 
     def run(
         self,
@@ -363,8 +379,7 @@ class GCGAttack:
         n_steps : int
             Number of optimisation iterations.
         early_stop : bool
-            If True, stop as soon as the model's greedy output starts with
-            ``target``.
+            If True, stop as soon as the model's greedy output starts with ``target``.
 
         Returns
         -------
@@ -385,56 +400,19 @@ class GCGAttack:
         print(f"{'Step':>6}  {'Loss':>8}  {'Time':>7}  Suffix")
         print(f"{'-'*6}  {'-'*8}  {'-'*7}  {'-'*40}")
 
-        for step in range(n_steps):
+        for step_num in range(1, n_steps + 1):
             step_start = time.perf_counter()
-
-            # Step 1 – tokenise and locate slices.
-            ts = find_token_slices(prompt, suffix, target, self.tokenizer)
-
-            # Step 2 – gradient pass → per-vocab scores at each suffix position.
-            token_grads = get_token_gradients(self.model, ts)
-
-            # Step 3 – sample candidate suffixes.
-            candidates = sample_candidates(
-                current_ids=ts.input_ids,
-                token_gradients=token_grads,
-                suffix_slice=ts.suffix_slice,
-                top_k=self.top_k,
-                n_candidates=self.n_candidates,
-            )
-
-            # Step 4 – evaluate and pick the best.
-            best_idx, best_loss = evaluate_candidates(
-                self.model, candidates, ts, batch_size=self.batch_size,
-            )
-
-            # Update the suffix with the winning candidate.
-            best_ids = candidates[best_idx]
-            suffix_ids = best_ids[ts.suffix_slice]
-            suffix = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
-
+            suffix, best_loss = self.step(prompt, suffix, target)
             elapsed = time.perf_counter() - step_start
 
-            print(
-                f"{step+1:>4}/{n_steps:<2}  "
-                f"{best_loss:>8.4f}  "
-                f"{elapsed:>6.1f}s  "
-                f"{suffix!r}"
-            )
+            print(f"{step_num:>4}/{n_steps:<2}  {best_loss:>8.4f}  {elapsed:>6.1f}s  {suffix!r}")
 
-            # Early stopping: check if the model already produces the target.
             if early_stop:
-                success, generated = self.check_early_stop(
-                    prompt, suffix, target
-                )
+                success, generated = self.check_early_stop(prompt, suffix, target)
                 if success:
-                    print(f"\n✅  Early stop at step {step+1}!")
-                    print(f"    Generated: {generated!r}")
+                    print(f"\n✅  Early stop at step {step_num}!\n    Generated: {generated!r}")
                     return suffix
 
-        print(f"\n{'='*70}")
-        print(f"  Finished {n_steps} steps (no early stop triggered)")
-        print(f"{'='*70}")
-
+        print(f"\n{'='*70}\n  Finished {n_steps} steps (no early stop triggered)\n{'='*70}")
         return suffix
 

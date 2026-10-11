@@ -33,3 +33,19 @@ Point `--model` directly to the local folder containing model weights (`config.j
 ```bash
 uv run python run.py --model /path/to/local/model
 ```
+
+## Web UI Studio
+
+Launch the zero-dependency local web dashboard to run natural baseline comparisons, configure GCG attacks, inspect loss curves, and evaluate adversarial suffixes interactively:
+
+```bash
+uv run python web_ui.py
+# Or with custom port:
+uv run python web_ui.py --port 8000
+```
+
+## Running Automated Tests
+
+```bash
+uv run python test_attack.py --model gpt2 --steps 10
+```
