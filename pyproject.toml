@@ -1,0 +1,14 @@
+[project]
+name = "gcg-imp"
+version = "0.1.0"
+description = "Minimal Greedy Coordinate Gradient (GCG) implementation on Apple Silicon MPS"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "torch>=2.14.1",
+    "transformers>=5.19.0",
+]
+
+[tool.uv]
+package = false
