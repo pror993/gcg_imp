@@ -1,10 +1,376 @@
+"""
+Greedy Coordinate Gradient (GCG) attack implementation.
+
+Reference: Zou et al., "Universal and Transferable Adversarial Attacks on
+Aligned Language Models", 2023.
+
+The algorithm optimises an adversarial suffix so that the model is steered
+towards producing a specific target string.  At each step we:
+  1. Tokenise  prompt ‖ suffix ‖ target  and locate the suffix / target slices.
+  2. Compute per-token gradients of the target-token cross-entropy loss
+     w.r.t. the suffix embeddings, then project onto the full vocabulary.
+  3. Sample candidate replacements by swapping one suffix token at a time
+     with a top-k candidate from the gradient ranking.
+  4. Evaluate all candidates in a batched forward pass and keep the winner.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
+import torch
+import torch.nn.functional as F
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
+
+
+# ---------------------------------------------------------------------------
+# Data container returned by find_token_slices
+# ---------------------------------------------------------------------------
+@dataclass
+class TokenSlices:
+    """Holds the full token sequence and the index ranges for each segment."""
+    input_ids: torch.Tensor       # (seq_len,)  – full tokenised sequence
+    suffix_slice: slice           # index range of the suffix tokens
+    target_slice: slice           # index range of the target tokens
+    # For the loss we predict the *next* token, so the logit positions that
+    # correspond to target tokens are shifted left by one.
+    loss_slice: slice             # logit positions used for the CE loss
+
+
+# ---------------------------------------------------------------------------
+# Step 1 – Slice the tokens
+# ---------------------------------------------------------------------------
+def find_token_slices(
+    prompt: str,
+    suffix: str,
+    target: str,
+    tokenizer: PreTrainedTokenizerBase,
+) -> TokenSlices:
+    """Tokenise  prompt ‖ suffix ‖ target  and find the exact index ranges.
+
+    We tokenise each piece individually and concatenate so that we know the
+    exact boundaries, avoiding any ambiguity from merges at the boundaries
+    (a known tokeniser quirk – we accept the small mismatch for clarity).
+
+    Returns a ``TokenSlices`` with the full ``input_ids`` tensor (1-D, on CPU)
+    and the three slices.
+    """
+    # Tokenise each segment independently (no special tokens).
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+    target_ids = tokenizer.encode(target, add_special_tokens=False)
+
+    full_ids = prompt_ids + suffix_ids + target_ids
+
+    # Compute index boundaries.
+    p_len = len(prompt_ids)
+    s_len = len(suffix_ids)
+    t_len = len(target_ids)
+
+    suffix_slice = slice(p_len, p_len + s_len)
+    target_slice = slice(p_len + s_len, p_len + s_len + t_len)
+
+    # For auto-regressive loss the logit at position i predicts token i+1,
+    # so the logit positions that predict the target tokens are one step
+    # earlier: [target_start - 1, target_end - 1).
+    loss_slice = slice(target_slice.start - 1, target_slice.stop - 1)
+
+    input_ids = torch.tensor(full_ids, dtype=torch.long)
+
+    return TokenSlices(
+        input_ids=input_ids,
+        suffix_slice=suffix_slice,
+        target_slice=target_slice,
+        loss_slice=loss_slice,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 2 – Get gradients on suffix embeddings projected to vocab
+# ---------------------------------------------------------------------------
+@torch.enable_grad()
+def get_token_gradients(
+    model: PreTrainedModel,
+    token_slices: TokenSlices,
+) -> torch.Tensor:
+    """Compute the gradient-based score for every vocab token at each suffix position.
+
+    Returns
+    -------
+    token_gradients : Tensor of shape ``(suffix_len, vocab_size)``
+        Lower (more negative) values indicate tokens that would *decrease*
+        the loss most if substituted in.
+    """
+    device = next(model.parameters()).device
+    embed_layer = model.get_input_embeddings()          # nn.Embedding
+    embed_weights = embed_layer.weight                  # (vocab_size, d_model)
+
+    input_ids = token_slices.input_ids.to(device)       # (seq_len,)
+
+    # --- build the one-hot → embedding manually for the suffix so we can
+    #     differentiate through it. ------------------------------------------
+    # Convert ids to one-hot for the suffix positions only.
+    suffix_ids = input_ids[token_slices.suffix_slice]    # (suffix_len,)
+    suffix_len = suffix_ids.shape[0]
+    vocab_size = embed_weights.shape[0]
+
+    # One-hot representation of the suffix tokens – requires grad.
+    one_hot = torch.zeros(
+        suffix_len, vocab_size, device=device, dtype=embed_weights.dtype
+    )
+    one_hot.scatter_(1, suffix_ids.unsqueeze(1), 1.0)
+    one_hot.requires_grad_(True)
+
+    # Suffix embeddings via matmul with embedding table.
+    suffix_embeds = one_hot @ embed_weights              # (suffix_len, d_model)
+
+    # Embeddings for the rest of the sequence (no grad needed).
+    with torch.no_grad():
+        prefix_embeds = embed_layer(input_ids[:token_slices.suffix_slice.start])
+        postfix_embeds = embed_layer(input_ids[token_slices.suffix_slice.stop:])
+
+    # Concatenate: prefix ‖ suffix ‖ postfix
+    full_embeds = torch.cat(
+        [prefix_embeds, suffix_embeds, postfix_embeds], dim=0
+    ).unsqueeze(0)  # (1, seq_len, d_model)
+
+    # --- forward pass -------------------------------------------------------
+    logits = model(inputs_embeds=full_embeds).logits      # (1, seq_len, vocab)
+
+    # Slice out the logits that predict the target tokens.
+    loss_logits = logits[0, token_slices.loss_slice, :]   # (target_len, vocab)
+    target_ids = input_ids[token_slices.target_slice]     # (target_len,)
+
+    loss = F.cross_entropy(loss_logits, target_ids)
+
+    # --- backward pass -------------------------------------------------------
+    loss.backward()
+
+    # The gradient on one_hot has shape (suffix_len, vocab_size).  Each entry
+    # tells us how much the loss would change if we increased the weight of
+    # that vocab token at that position – i.e. the projected gradient.
+    token_gradients = one_hot.grad.clone()               # (suffix_len, vocab_size)
+
+    # Clean up the computation graph.
+    model.zero_grad()
+
+    return token_gradients
+
+
+# ---------------------------------------------------------------------------
+# Step 3 – Sample candidate suffixes
+# ---------------------------------------------------------------------------
+def sample_candidates(
+    current_ids: torch.Tensor,
+    token_gradients: torch.Tensor,
+    suffix_slice: slice,
+    top_k: int = 256,
+    n_candidates: int = 256,
+) -> torch.Tensor:
+    """Sample candidate suffix replacements using top-k gradient info.
+
+    For each candidate we:
+      1. Pick a random position in the suffix.
+      2. Replace the token at that position with one of the top-k tokens
+         (chosen uniformly at random from the k best per that position).
+
+    Parameters
+    ----------
+    current_ids : Tensor (seq_len,)
+        The current full token sequence.
+    token_gradients : Tensor (suffix_len, vocab_size)
+        Gradient scores from ``get_token_gradients``.
+    suffix_slice : slice
+        Index range of the suffix inside ``current_ids``.
+    top_k : int
+        Number of lowest-gradient candidates to consider per position.
+    n_candidates : int
+        How many candidate sequences to generate.
+
+    Returns
+    -------
+    candidates : Tensor (n_candidates, seq_len)
+        Each row is a full token sequence with exactly one suffix token swapped.
+    """
+    suffix_len = token_gradients.shape[0]
+
+    # For each suffix position, find the top_k tokens with the LOWEST gradient
+    # (steepest descent direction).
+    # torch.topk with largest=False gives the smallest values.
+    top_k_ids = (-token_gradients).topk(top_k, dim=1).indices  # (suffix_len, top_k)
+
+    # Tile the current sequence into (n_candidates, seq_len).
+    candidates = current_ids.unsqueeze(0).repeat(n_candidates, 1)
+
+    # For each candidate, pick a random suffix position and a random top-k token.
+    random_positions = torch.randint(0, suffix_len, (n_candidates,))
+    random_top_k_idx = torch.randint(0, top_k, (n_candidates,))
+
+    # Gather the replacement token ids.
+    replacement_tokens = top_k_ids[random_positions, random_top_k_idx]
+
+    # Write replacements into the candidate sequences.
+    absolute_positions = random_positions + suffix_slice.start
+    candidates[torch.arange(n_candidates), absolute_positions] = replacement_tokens
+
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Step 4 – Evaluate candidates and pick the best
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def evaluate_candidates(
+    model: PreTrainedModel,
+    candidates: torch.Tensor,
+    token_slices: TokenSlices,
+    batch_size: int = 64,
+) -> Tuple[int, float]:
+    """Run a batched forward pass over candidates and return the best one.
+
+    Parameters
+    ----------
+    model : PreTrainedModel
+    candidates : Tensor (n_candidates, seq_len)
+    token_slices : TokenSlices
+        Provides ``loss_slice`` and ``target_slice`` (index ranges are the
+        same for every candidate since sequence length is fixed).
+    batch_size : int
+        Process candidates in chunks to avoid OOM.
+
+    Returns
+    -------
+    best_idx : int
+        Index into ``candidates`` of the lowest-loss candidate.
+    best_loss : float
+        The cross-entropy loss achieved by the best candidate.
+    """
+    device = next(model.parameters()).device
+    n_candidates = candidates.shape[0]
+    target_ids = token_slices.input_ids[token_slices.target_slice].to(device)
+
+    all_losses = []
+
+    for start in range(0, n_candidates, batch_size):
+        end = min(start + batch_size, n_candidates)
+        batch_ids = candidates[start:end].to(device)       # (B, seq_len)
+
+        logits = model(input_ids=batch_ids).logits          # (B, seq_len, vocab)
+
+        # Slice out the logits that predict target tokens.
+        loss_logits = logits[:, token_slices.loss_slice, :]  # (B, target_len, vocab)
+
+        # Compute per-candidate cross-entropy loss.
+        # Reshape for F.cross_entropy: (B * target_len, vocab) vs (B * target_len,)
+        B, T, V = loss_logits.shape
+        flat_logits = loss_logits.reshape(B * T, V)
+        flat_targets = target_ids.unsqueeze(0).expand(B, -1).reshape(B * T)
+        per_token_loss = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        per_candidate_loss = per_token_loss.view(B, T).mean(dim=1)  # (B,)
+
+        all_losses.append(per_candidate_loss)
+
+    all_losses = torch.cat(all_losses)                      # (n_candidates,)
+    best_idx = all_losses.argmin().item()
+    best_loss = all_losses[best_idx].item()
+
+    return best_idx, best_loss
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator class
+# ---------------------------------------------------------------------------
 class GCGAttack:
-    """Greedy Coordinate Gradient (GCG) attack placeholder.
+    """Greedy Coordinate Gradient (GCG) attack.
 
     Coordinates token-level gradient calculation and candidate substitution
     to find adversarial suffixes that elicit target model outputs.
     """
 
-    def __init__(self, model, tokenizer):
+    def __init__(
+        self,
+        model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        top_k: int = 256,
+        n_candidates: int = 256,
+        batch_size: int = 64,
+    ):
         self.model = model
         self.tokenizer = tokenizer
+        self.top_k = top_k
+        self.n_candidates = n_candidates
+        self.batch_size = batch_size
+
+    # ---- public API --------------------------------------------------------
+
+    def run(
+        self,
+        prompt: str,
+        target: str,
+        suffix: str | None = None,
+        n_steps: int = 20,
+    ) -> str:
+        """Run the GCG optimisation loop.
+
+        Parameters
+        ----------
+        prompt : str
+            The user prompt (e.g. an instruction the model would normally refuse).
+        target : str
+            The desired model output prefix (e.g. "Sure, here is").
+        suffix : str | None
+            Initial adversarial suffix.  Defaults to 20 ``"!"`` characters.
+        n_steps : int
+            Number of optimisation iterations.
+
+        Returns
+        -------
+        suffix : str
+            The optimised adversarial suffix.
+        """
+        if suffix is None:
+            suffix = "! " * 20
+
+        print(f"\n{'='*60}")
+        print(f"GCG Attack  |  steps={n_steps}  top_k={self.top_k}  "
+              f"candidates={self.n_candidates}")
+        print(f"Prompt : {prompt}")
+        print(f"Target : {target}")
+        print(f"Initial: {suffix!r}")
+        print(f"{'='*60}\n")
+
+        for step in range(n_steps):
+            # Step 1 – tokenise and locate slices.
+            ts = find_token_slices(prompt, suffix, target, self.tokenizer)
+
+            # Step 2 – gradient pass → per-vocab scores at each suffix position.
+            token_grads = get_token_gradients(self.model, ts)
+
+            # Step 3 – sample candidate suffixes.
+            candidates = sample_candidates(
+                current_ids=ts.input_ids,
+                token_gradients=token_grads,
+                suffix_slice=ts.suffix_slice,
+                top_k=self.top_k,
+                n_candidates=self.n_candidates,
+            )
+
+            # Step 4 – evaluate and pick the best.
+            best_idx, best_loss = evaluate_candidates(
+                self.model, candidates, ts, batch_size=self.batch_size,
+            )
+
+            # Update the suffix with the winning candidate.
+            best_ids = candidates[best_idx]
+            suffix_ids = best_ids[ts.suffix_slice]
+            suffix = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
+
+            print(
+                f"[Step {step+1:>3}/{n_steps}]  "
+                f"loss={best_loss:.4f}  "
+                f"suffix={suffix!r}"
+            )
+
+        return suffix
