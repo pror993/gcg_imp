@@ -16,6 +16,7 @@ towards producing a specific target string.  At each step we:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -303,6 +304,42 @@ class GCGAttack:
         self.n_candidates = n_candidates
         self.batch_size = batch_size
 
+    # ---- helpers -----------------------------------------------------------
+
+    @torch.no_grad()
+    def check_early_stop(
+        self,
+        prompt: str,
+        suffix: str,
+        target: str,
+        max_new_tokens: int = 32,
+    ) -> Tuple[bool, str]:
+        """Generate greedily from  prompt ‖ suffix  and check for the target.
+
+        Returns ``(success, generated_text)``.  ``success`` is True when the
+        generated text starts with ``target`` (case-insensitive, stripped).
+        """
+        device = next(self.model.parameters()).device
+        full_prompt = prompt + suffix
+        input_ids = self.tokenizer.encode(
+            full_prompt, return_tensors="pt", add_special_tokens=False
+        ).to(device)
+
+        output_ids = self.model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+
+        # Decode only the newly generated tokens.
+        generated = self.tokenizer.decode(
+            output_ids[0, input_ids.shape[1]:], skip_special_tokens=True
+        ).strip()
+
+        success = generated.lower().startswith(target.lower().strip())
+        return success, generated
+
     # ---- public API --------------------------------------------------------
 
     def run(
@@ -311,6 +348,7 @@ class GCGAttack:
         target: str,
         suffix: str | None = None,
         n_steps: int = 20,
+        early_stop: bool = True,
     ) -> str:
         """Run the GCG optimisation loop.
 
@@ -324,6 +362,9 @@ class GCGAttack:
             Initial adversarial suffix.  Defaults to 20 ``"!"`` characters.
         n_steps : int
             Number of optimisation iterations.
+        early_stop : bool
+            If True, stop as soon as the model's greedy output starts with
+            ``target``.
 
         Returns
         -------
@@ -333,15 +374,20 @@ class GCGAttack:
         if suffix is None:
             suffix = "! " * 20
 
-        print(f"\n{'='*60}")
-        print(f"GCG Attack  |  steps={n_steps}  top_k={self.top_k}  "
-              f"candidates={self.n_candidates}")
-        print(f"Prompt : {prompt}")
-        print(f"Target : {target}")
-        print(f"Initial: {suffix!r}")
-        print(f"{'='*60}\n")
+        print(f"\n{'='*70}")
+        print(f"  GCG Attack")
+        print(f"  steps={n_steps}  top_k={self.top_k}  "
+              f"candidates={self.n_candidates}  batch_size={self.batch_size}")
+        print(f"  Prompt : {prompt}")
+        print(f"  Target : {target}")
+        print(f"  Suffix : {suffix!r}")
+        print(f"{'='*70}")
+        print(f"{'Step':>6}  {'Loss':>8}  {'Time':>7}  Suffix")
+        print(f"{'-'*6}  {'-'*8}  {'-'*7}  {'-'*40}")
 
         for step in range(n_steps):
+            step_start = time.perf_counter()
+
             # Step 1 – tokenise and locate slices.
             ts = find_token_slices(prompt, suffix, target, self.tokenizer)
 
@@ -367,10 +413,28 @@ class GCGAttack:
             suffix_ids = best_ids[ts.suffix_slice]
             suffix = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
 
+            elapsed = time.perf_counter() - step_start
+
             print(
-                f"[Step {step+1:>3}/{n_steps}]  "
-                f"loss={best_loss:.4f}  "
-                f"suffix={suffix!r}"
+                f"{step+1:>4}/{n_steps:<2}  "
+                f"{best_loss:>8.4f}  "
+                f"{elapsed:>6.1f}s  "
+                f"{suffix!r}"
             )
 
+            # Early stopping: check if the model already produces the target.
+            if early_stop:
+                success, generated = self.check_early_stop(
+                    prompt, suffix, target
+                )
+                if success:
+                    print(f"\n✅  Early stop at step {step+1}!")
+                    print(f"    Generated: {generated!r}")
+                    return suffix
+
+        print(f"\n{'='*70}")
+        print(f"  Finished {n_steps} steps (no early stop triggered)")
+        print(f"{'='*70}")
+
         return suffix
+
