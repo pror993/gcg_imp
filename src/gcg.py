@@ -307,6 +307,7 @@ class GCGAttack:
         suffix: str,
         target: str,
         max_new_tokens: int = 32,
+        use_chat_template: bool = False,
     ) -> Tuple[bool, str]:
         """Generate greedily from  prompt ‖ suffix  and check for the target.
 
@@ -315,9 +316,17 @@ class GCGAttack:
         """
         device = next(self.model.parameters()).device
         full_prompt = prompt + suffix
-        input_ids = self.tokenizer.encode(
-            full_prompt, return_tensors="pt", add_special_tokens=False
-        ).to(device)
+        if use_chat_template and getattr(self.tokenizer, "chat_template", None) is not None:
+            messages = [{"role": "user", "content": full_prompt}]
+            formatted = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self.tokenizer(formatted, return_tensors="pt").to(device)
+            input_ids = inputs["input_ids"]
+        else:
+            input_ids = self.tokenizer.encode(
+                full_prompt, return_tensors="pt", add_special_tokens=False
+            ).to(device)
 
         output_ids = self.model.generate(
             input_ids,
@@ -365,6 +374,7 @@ class GCGAttack:
         suffix: str | None = None,
         n_steps: int = 20,
         early_stop: bool = True,
+        use_chat_template: bool = False,
     ) -> str:
         """Run the GCG optimisation loop.
 
@@ -408,7 +418,9 @@ class GCGAttack:
             print(f"{step_num:>4}/{n_steps:<2}  {best_loss:>8.4f}  {elapsed:>6.1f}s  {suffix!r}")
 
             if early_stop:
-                success, generated = self.check_early_stop(prompt, suffix, target)
+                success, generated = self.check_early_stop(
+                    prompt, suffix, target, use_chat_template=use_chat_template
+                )
                 if success:
                     print(f"\n✅  Early stop at step {step_num}!\n    Generated: {generated!r}")
                     return suffix

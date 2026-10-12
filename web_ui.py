@@ -71,6 +71,7 @@ def generate_text(
     prompt: str,
     suffix: str = "",
     max_new_tokens: int = 64,
+    use_chat_template: bool = False,
 ) -> Dict[str, Any]:
     """Greedy generation helper for natural or suffix-augmented prompts."""
     t0 = time.perf_counter()
@@ -78,13 +79,12 @@ def generate_text(
 
     full_prompt = prompt + (suffix if suffix else "")
 
-    if getattr(tokenizer, "chat_template", None) is not None:
+    if use_chat_template and getattr(tokenizer, "chat_template", None) is not None:
         messages = [{"role": "user", "content": full_prompt}]
         formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(formatted, return_tensors="pt").to(device)
     else:
-        formatted = full_prompt
-
-    inputs = tokenizer(formatted, return_tensors="pt").to(device)
+        inputs = tokenizer(full_prompt, return_tensors="pt", add_special_tokens=False).to(device)
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
@@ -116,7 +116,7 @@ def run_attack_worker(config: Dict[str, Any]) -> None:
     batch_size = int(config.get("batch_size", 16))
     max_new_tokens = int(config.get("max_new_tokens", 32))
     early_stop = bool(config.get("early_stop", True))
-
+    use_chat_template = bool(config.get("use_chat_template", False))
     with _STATE_LOCK:
         _CURRENT_RUN.update({
             "status": "loading",
@@ -171,15 +171,21 @@ def run_attack_worker(config: Dict[str, Any]) -> None:
             log_event(f"Step {step}/{n_steps} | Loss: {loss:.4f} | {step_time:.2f}s | Suffix: {suffix!r}")
 
             if early_stop:
-                success, generated = attack.check_early_stop(prompt, suffix, target, max_new_tokens=max_new_tokens)
+                success, generated = attack.check_early_stop(
+                    prompt, suffix, target,
+                    max_new_tokens=max_new_tokens,
+                    use_chat_template=use_chat_template,
+                )
                 if success:
                     log_event(f"✅ Early stop triggered! Generated: {generated!r}")
                     break
-
         # Final generation test
         log_event("Testing model output with final optimized suffix...")
-        gen_result = generate_text(model_name, prompt, suffix=suffix, max_new_tokens=max_new_tokens)
-        log_event(f"Response: {gen_result['response']!r}")
+        gen_result = generate_text(
+            model_name, prompt, suffix=suffix,
+            max_new_tokens=max_new_tokens,
+            use_chat_template=use_chat_template,
+        )
 
         with _STATE_LOCK:
             if _CURRENT_RUN["status"] != "stopped":
@@ -399,10 +405,17 @@ HTML_PAGE = """<!DOCTYPE html>
               <input type="number" id="max_new_tokens" value="48">
               <p class="hint">Token limit for model generation during early-stop checks and final output. 32-64 is typical; increase to see longer completions.</p>
             </div>
-            <div style="display: flex; align-items: center; margin-top: 14px;">
-              <input type="checkbox" id="early_stop" checked style="width: auto; margin-right: 6px; margin-bottom: 0;">
-              <label for="early_stop" style="margin-bottom: 0; cursor: pointer;">Early Stop</label>
-              <p class="hint" style="margin: 0 0 0 4px;">Stop when the model generates the target prefix. Disable to observe full loss trajectory.</p>
+            <div style="display: flex; flex-direction: column; justify-content: center; gap: 6px; margin-top: 10px;">
+              <div style="display: flex; align-items: center;">
+                <input type="checkbox" id="early_stop" checked style="width: auto; margin-right: 6px; margin-bottom: 0;">
+                <label for="early_stop" style="margin-bottom: 0; cursor: pointer;">Early Stop</label>
+                <p class="hint" style="margin: 0 0 0 4px;">Stop when the model generates target prefix.</p>
+              </div>
+              <div style="display: flex; align-items: center;">
+                <input type="checkbox" id="use_chat_template" style="width: auto; margin-right: 6px; margin-bottom: 0;">
+                <label for="use_chat_template" style="margin-bottom: 0; cursor: pointer;">Chat Template</label>
+                <p class="hint" style="margin: 0 0 0 4px;">Wrap in chat template (off by default to match GCG optimization).</p>
+              </div>
             </div>
           </div>
         </div>
@@ -536,7 +549,8 @@ HTML_PAGE = """<!DOCTYPE html>
             model: document.getElementById('model').value,
             prompt: document.getElementById('prompt').value,
             suffix: '',
-            max_new_tokens: parseInt(document.getElementById('max_new_tokens').value) || 48
+            max_new_tokens: parseInt(document.getElementById('max_new_tokens').value) || 48,
+            use_chat_template: document.getElementById('use_chat_template').checked
           })
         });
         const data = await res.json();
@@ -570,7 +584,8 @@ HTML_PAGE = """<!DOCTYPE html>
             model: document.getElementById('model').value,
             prompt: document.getElementById('prompt').value,
             suffix: document.getElementById('suffix').value,
-            max_new_tokens: parseInt(document.getElementById('max_new_tokens').value) || 48
+            max_new_tokens: parseInt(document.getElementById('max_new_tokens').value) || 48,
+            use_chat_template: document.getElementById('use_chat_template').checked
           })
         });
         const data = await res.json();
@@ -599,6 +614,7 @@ HTML_PAGE = """<!DOCTYPE html>
         batch_size: parseInt(document.getElementById('batch_size').value),
         max_new_tokens: parseInt(document.getElementById('max_new_tokens').value),
         early_stop: document.getElementById('early_stop').checked,
+        use_chat_template: document.getElementById('use_chat_template').checked,
       };
 
       document.getElementById('btnRunAttack').disabled = true;
@@ -727,6 +743,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     prompt=payload.get("prompt", ""),
                     suffix=payload.get("suffix", ""),
                     max_new_tokens=int(payload.get("max_new_tokens", 48)),
+                    use_chat_template=bool(payload.get("use_chat_template", False)),
                 )
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

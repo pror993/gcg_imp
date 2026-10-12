@@ -75,6 +75,12 @@ def main():
         default=64,
         help="Max new tokens when generating the final test output",
     )
+    parser.add_argument(
+        "--use-chat-template",
+        action="store_true",
+        default=False,
+        help="Apply chat template during early stop and final generation (disabled by default to match GCG optimization)",
+    )
     args = parser.parse_args()
 
     device = get_device()
@@ -101,6 +107,7 @@ def main():
         target=args.target,
         suffix=args.suffix,
         n_steps=args.steps,
+        use_chat_template=args.use_chat_template,
     )
 
     # --- Test the optimised suffix ---
@@ -110,16 +117,15 @@ def main():
 
     full_prompt = args.prompt + optimised_suffix
 
-    # Apply chat template if available.
-    if getattr(tokenizer, "chat_template", None) is not None:
+    # Apply chat template if requested and available.
+    if args.use_chat_template and getattr(tokenizer, "chat_template", None) is not None:
         messages = [{"role": "user", "content": full_prompt}]
         formatted = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        inputs = tokenizer(formatted, return_tensors="pt").to(device)
     else:
-        formatted = full_prompt
-
-    inputs = tokenizer(formatted, return_tensors="pt").to(device)
+        inputs = tokenizer(full_prompt, return_tensors="pt", add_special_tokens=False).to(device)
 
     with torch.no_grad():
         outputs = model.generate(
