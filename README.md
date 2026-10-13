@@ -219,9 +219,9 @@ Launch the zero-dependency browser dashboard:
 uv run python web_ui.py --port 7860
 ```
 
-1. **Natural Response**: Inspect unattacked baseline completions.
-2. **Real-time GCG Optimization**: Monitor live loss curves, step latency, and token mutations.
-3. **Suffix Validation**: Side-by-side completion comparison with and without optimized suffixes.
+1. **Algorithm & Architecture Selection**: Switch seamlessly between GCG (coordinate descent + search) and HotFlip (greedy 1st-order flip) on either Causal LMs (suffix generation) or Sequence Classifiers (guardrail label flips).
+2. **Real-Time Optimization**: Live loss curves, step latency tracking, and token flip telemetry.
+3. **Side-by-Side Verification**: Compare baseline vs. attacked outputs (text completions for causal LMs or confidence distributions for classifiers).
 
 ---
 
