@@ -94,7 +94,7 @@ def run_test(model, tokenizer, test_case, n_steps, top_k, n_candidates, batch_si
         step_start = time.perf_counter()
 
         ts = find_token_slices(prompt, suffix, target, tokenizer)
-        token_grads = get_token_gradients(model, ts)
+        token_grads = get_token_gradients(model, ts, filter_mask=attack.filter_mask)
         candidates = sample_candidates(
             current_ids=ts.input_ids,
             token_gradients=token_grads,

@@ -19,8 +19,8 @@ Each optimization step performs four operations:
 │  Input:   [prompt tokens]  [suffix tokens]  [target tokens]        │
 │                                                                      │
 │  Step 1   Tokenize prompt ‖ suffix ‖ target, locate index slices    │
-│  Step 2   Build one-hot suffix → embed → forward → loss → backward  │
-│           Gradient on one-hot = projected vocab-level gradient       │
+│  Step 2   inputs_embeds → forward → loss → backward → Taylor projection│
+│           grad @ W_embed.T = projected vocab-level gradient score      │
 │  Step 3   For each candidate: pick random suffix position,          │
 │           replace with a top-k token from gradient ranking           │
 │  Step 4   Batch forward pass over all candidates, keep argmin(loss) │
@@ -56,14 +56,14 @@ gcg_imp/
 |---|---|
 | `TokenSlices` | Dataclass holding `input_ids` and `suffix_slice`, `target_slice`, `loss_slice` index ranges |
 | `find_token_slices()` | Tokenizes `prompt ‖ suffix ‖ target` independently and computes exact index boundaries |
-| `get_token_gradients()` | One-hot → embedding matmul → forward → CE loss → backward. Returns `(suffix_len, vocab_size)` gradient tensor |
-| `sample_candidates()` | For each of N candidates: pick random suffix position, swap with a uniformly-sampled top-k token |
+| `get_token_gradients()` | Forward via `inputs_embeds` → CE loss → backward → Taylor projection (`grad @ W_embed.T`). Optional token filter mask. |
+| `sample_candidates()` | Retains candidate 0 as identity (monotonicity); samples 1..N-1 with top-k replacements |
 | `evaluate_candidates()` | Batched forward pass over all candidates, returns `(best_idx, best_loss)` |
 | `GCGAttack` | Orchestrator class with `step()` for single iterations and `run()` for the full loop |
 
 **`src/model.py`** — Loads any HuggingFace causal LM with automatic device placement and `pad_token` fallback.
 
-**`src/utils.py`** — `get_device()` returns MPS/CUDA/CPU; `clear_memory()` flushes backend caches.
+**`src/utils.py`** — `get_device()` returns MPS/CUDA/CPU; `clear_memory()` flushes backend caches; `get_non_ascii_mask()` builds boolean masks for non-ASCII/special tokens.
 
 ---
 
@@ -162,6 +162,7 @@ All parameters are configurable via CLI flags (`run.py`, `test_attack.py`) and t
 | **Max Tokens** | 32 | Generation length for early-stop check | 32-64 is typical. Increase to see longer completions during testing. |
 | **Early Stop** | `True` | Stop when model generates target prefix | Disable to observe the full loss trajectory without interruption. |
 | **Chat Template** | `False` | Apply model chat template during generation | When False (default), generation matches the raw token sequence optimized by GCG. When True, wraps input in the chat template (e.g. ChatML). |
+| **Allow Non-ASCII** | `False` | Permit non-ASCII/special tokens | When False (default), filters unprintable unicode, replacement characters, and special tokens from candidate pool. |
 ### Recommended Configurations
 
 **Quick debugging** (GPT-2, ~1 min):
@@ -180,6 +181,30 @@ uv run python run.py --steps 300 --n-candidates 512 --top-k 512 --batch-size 16
 ```
 
 ---
+
+
+## Key Algorithmic & Systems Enhancements
+
+This implementation builds directly on canonical GCG with three grounded mathematical and systems refinements:
+
+### 1. Monotonic Identity Candidate ($c_0$) Preservation
+In standard random coordinate sampling, every candidate mutates at least one token coordinate. If none of the sampled top-$k$ substitutions yield lower loss than the current state, the optimizer is forced to adopt a suboptimal candidate, leading to loss spikes and erratic trajectories.
+
+By preserving candidate index 0 as the unmodified sequence $x^{(t)}$, we enforce the coordinate descent invariant:
+$$\mathcal{L}(x^{(t+1)}) \le \mathcal{L}(x^{(t)})$$
+If all proposed mutations fail to decrease loss, $c_0$ is retained, ensuring strictly non-increasing loss progression.
+
+### 2. Direct Embedding Gradient Projection via `inputs_embeds`
+Rather than allocating a dense one-hot tensor $\mathbb{R}^{m \times V}$ and routing autograd through custom prefix/suffix slices, the forward pass runs directly on `inputs_embeds = embed_layer(input_ids).unsqueeze(0).detach().requires_grad_(True)`.
+
+The vocabulary-level gradient scores are computed via the exact first-order Taylor expansion:
+$$\nabla_{\text{vocab}} \mathcal{L} = \nabla_{e_{\text{suffix}}} \mathcal{L} \cdot W_e^T \in \mathbb{R}^{m \times V}$$
+This eliminates graph nodes and allocations for $(m \times V)$ float tensors, reducing memory overhead and delivering identical gradients ($\Delta = 0.0$).
+
+### 3. Non-ASCII & Special Token Filtering
+Language model vocabularies (e.g. LLaMA, Qwen, GPT-2) include hundreds of raw byte tokens, non-printable Unicode characters, and control tokens (`<|endoftext|>`, `<|im_start|>`). Without filtering, GCG frequently selects these tokens to minimize loss via tokenizer edge cases rather than true prompt jailbreaks.
+
+`get_non_ascii_mask()` inspects token decodings at initialization and precomputes a boolean mask flagging non-ASCII, unprintable (`\ufffd`), and special tokens. Masked tokens receive a score of $+\infty$, ensuring `topk()` (steepest descent) never selects them.
 
 ## Implementation Notes
 

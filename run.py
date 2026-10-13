@@ -81,6 +81,12 @@ def main():
         default=False,
         help="Apply chat template during early stop and final generation (disabled by default to match GCG optimization)",
     )
+    parser.add_argument(
+        "--allow-non-ascii",
+        action="store_true",
+        default=False,
+        help="Allow non-ASCII and special tokens in candidate substitutions (disabled by default)",
+    )
     args = parser.parse_args()
 
     device = get_device()
@@ -100,6 +106,7 @@ def main():
         top_k=args.top_k,
         n_candidates=args.n_candidates,
         batch_size=args.batch_size,
+        filter_non_ascii=not args.allow_non_ascii,
     )
 
     optimised_suffix = attack.run(

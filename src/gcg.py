@@ -23,6 +23,7 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from src.utils import get_non_ascii_mask
 
 
 # ---------------------------------------------------------------------------
@@ -94,8 +95,22 @@ def find_token_slices(
 def get_token_gradients(
     model: PreTrainedModel,
     token_slices: TokenSlices,
+    filter_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute the gradient-based score for every vocab token at each suffix position.
+    """Compute the first-order Taylor gradient scores for every vocab token at each suffix position.
+
+    Differentiates loss directly with respect to full sequence embeddings and projects
+    the gradient onto the vocabulary embedding table via matrix multiplication (``grad @ W_embed.T``).
+
+    Parameters
+    ----------
+    model : PreTrainedModel
+        Target causal language model.
+    token_slices : TokenSlices
+        Data container with input IDs and slice boundaries.
+    filter_mask : Tensor, optional
+        Boolean tensor of shape ``(vocab_size,)`` where ``True`` marks tokens to
+        exclude (e.g. non-ASCII or special tokens). Masked tokens receive ``+inf``.
 
     Returns
     -------
@@ -109,51 +124,33 @@ def get_token_gradients(
 
     input_ids = token_slices.input_ids.to(device)       # (seq_len,)
 
-    # --- build the one-hot → embedding manually for the suffix so we can
-    #     differentiate through it. ------------------------------------------
-    # Convert ids to one-hot for the suffix positions only.
-    suffix_ids = input_ids[token_slices.suffix_slice]    # (suffix_len,)
-    suffix_len = suffix_ids.shape[0]
-    vocab_size = embed_weights.shape[0]
+    # 1. Forward embeddings with gradient tracking enabled on inputs_embeds
+    # Avoids constructing and differentiating through dense (suffix_len, vocab_size) one-hot matrices.
+    inputs_embeds = embed_layer(input_ids).unsqueeze(0).detach().requires_grad_(True)
 
-    # One-hot representation of the suffix tokens – requires grad.
-    one_hot = torch.zeros(
-        suffix_len, vocab_size, device=device, dtype=embed_weights.dtype
-    )
-    one_hot.scatter_(1, suffix_ids.unsqueeze(1), 1.0)
-    one_hot.requires_grad_(True)
+    # 2. Forward pass through causal transformer
+    logits = model(inputs_embeds=inputs_embeds).logits  # (1, seq_len, vocab_size)
 
-    # Suffix embeddings via matmul with embedding table.
-    suffix_embeds = one_hot @ embed_weights              # (suffix_len, d_model)
-
-    # Embeddings for the rest of the sequence (no grad needed).
-    with torch.no_grad():
-        prefix_embeds = embed_layer(input_ids[:token_slices.suffix_slice.start])
-        postfix_embeds = embed_layer(input_ids[token_slices.suffix_slice.stop:])
-
-    # Concatenate: prefix ‖ suffix ‖ postfix
-    full_embeds = torch.cat(
-        [prefix_embeds, suffix_embeds, postfix_embeds], dim=0
-    ).unsqueeze(0)  # (1, seq_len, d_model)
-
-    # --- forward pass -------------------------------------------------------
-    logits = model(inputs_embeds=full_embeds).logits      # (1, seq_len, vocab)
-
-    # Slice out the logits that predict the target tokens.
-    loss_logits = logits[0, token_slices.loss_slice, :]   # (target_len, vocab)
-    target_ids = input_ids[token_slices.target_slice]     # (target_len,)
+    # 3. Compute cross-entropy loss over target token slice
+    loss_logits = logits[0, token_slices.loss_slice, :] # (target_len, vocab_size)
+    target_ids = input_ids[token_slices.target_slice]   # (target_len,)
 
     loss = F.cross_entropy(loss_logits, target_ids)
 
-    # --- backward pass -------------------------------------------------------
+    # 4. Backward pass to extract embedding gradients
     loss.backward()
 
-    # The gradient on one_hot has shape (suffix_len, vocab_size).  Each entry
-    # tells us how much the loss would change if we increased the weight of
-    # that vocab token at that position – i.e. the projected gradient.
-    token_gradients = one_hot.grad.clone()               # (suffix_len, vocab_size)
+    # 5. First-order Taylor projection: dot product with embedding matrix
+    # token_gradients[i, v] = <grad_i, e(v)>
+    # (suffix_len, d_model) @ (d_model, vocab_size) -> (suffix_len, vocab_size)
+    suffix_grad = inputs_embeds.grad[0, token_slices.suffix_slice, :]
+    token_gradients = suffix_grad @ embed_weights.T
 
-    # Clean up the computation graph.
+    # 6. Mask filtered tokens (non-ASCII, special) with +inf so top-k never selects them
+    if filter_mask is not None:
+        token_gradients[:, filter_mask.to(device)] = float("inf")
+
+    # Clean up computation graph
     model.zero_grad(set_to_none=True)
 
     return token_gradients
@@ -171,11 +168,10 @@ def sample_candidates(
 ) -> torch.Tensor:
     """Sample candidate suffix replacements using top-k gradient info.
 
-    For each candidate we:
-      1. Pick a random position in the suffix.
-      2. Replace the token at that position with one of the top-k tokens
-         (chosen uniformly at random from the k best per that position).
-
+    Candidate 0 is always retained as the unmodified current sequence to guarantee
+    monotonic (non-increasing) loss under coordinate descent. The remaining
+    ``n_candidates - 1`` candidates each substitute one random suffix position
+    with a random token from the top-k gradient pool.
     Parameters
     ----------
     current_ids : Tensor (seq_len,)
@@ -204,13 +200,16 @@ def sample_candidates(
     # Tile the current sequence on device into (n_candidates, seq_len).
     candidates = current_ids.to(device).unsqueeze(0).repeat(n_candidates, 1)
 
-    # Pick a random suffix position and top-k replacement token for each candidate.
-    rand_pos = torch.randint(0, suffix_len, (n_candidates,), device=device)
-    rand_k = torch.randint(0, top_k, (n_candidates,), device=device)
-    replacements = top_k_ids[rand_pos, rand_k]
+    # Candidate 0 is preserved as the current sequence (guarantees monotonic non-increasing loss).
+    # Mutate only candidates 1..n_candidates - 1.
+    n_mutations = n_candidates - 1
+    if n_mutations > 0:
+        rand_pos = torch.randint(0, suffix_len, (n_mutations,), device=device)
+        rand_k = torch.randint(0, top_k, (n_mutations,), device=device)
+        replacements = top_k_ids[rand_pos, rand_k]
 
-    # Mutate selected positions in-place.
-    candidates[torch.arange(n_candidates, device=device), rand_pos + suffix_slice.start] = replacements
+        # Mutate selected positions in-place for candidates 1 to N-1
+        candidates[1 + torch.arange(n_mutations, device=device), rand_pos + suffix_slice.start] = replacements
     return candidates
 
 
@@ -287,16 +286,27 @@ class GCGAttack:
         top_k: int = 256,
         n_candidates: int = 256,
         batch_size: int = 64,
+        filter_non_ascii: bool = True,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.top_k = top_k
         self.n_candidates = n_candidates
         self.batch_size = batch_size
+        self.filter_non_ascii = filter_non_ascii
 
         # Freeze model weights so backward only computes gradients for input tokens.
         for p in self.model.parameters():
             p.requires_grad = False
+
+        # Precompute vocabulary mask to filter non-ASCII and special tokens
+        device = next(self.model.parameters()).device
+        vocab_size = self.model.get_input_embeddings().weight.shape[0]
+        self.filter_mask = (
+            get_non_ascii_mask(self.tokenizer, vocab_size=vocab_size, device=device)
+            if self.filter_non_ascii
+            else None
+        )
 
     # ---- helpers -----------------------------------------------------------
 
@@ -352,7 +362,7 @@ class GCGAttack:
     ) -> Tuple[str, float]:
         """Execute one GCG iteration and return ``(updated_suffix, best_loss)``."""
         ts = find_token_slices(prompt, suffix, target, self.tokenizer)
-        token_grads = get_token_gradients(self.model, ts)
+        token_grads = get_token_gradients(self.model, ts, filter_mask=self.filter_mask)
         candidates = sample_candidates(
             current_ids=ts.input_ids,
             token_gradients=token_grads,
