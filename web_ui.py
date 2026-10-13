@@ -142,7 +142,7 @@ def generate_text(
         formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(formatted, return_tensors="pt").to(device)
     else:
-        inputs = tokenizer(full_prompt, return_tensors="pt", add_special_tokens=False).to(device)
+        inputs = tokenizer(full_prompt, return_tensors="pt", add_special_tokens=True).to(device)
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,

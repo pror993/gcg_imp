@@ -58,8 +58,13 @@ def find_token_slices(
     Returns a ``TokenSlices`` with the full ``input_ids`` tensor (1-D, on CPU)
     and the three slices.
     """
-    # Tokenise each segment independently (no special tokens).
-    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    # Tokenise prompt preserving BOS (attention sink) at index 0 for models that require it.
+    # Strip trailing EOS token if the tokenizer appends it to individual sentences.
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+    if tokenizer.eos_token_id is not None and len(prompt_ids) > 0 and prompt_ids[-1] == tokenizer.eos_token_id:
+        prompt_ids = prompt_ids[:-1]
+
+    # Tokenise suffix and target strictly without special tokens.
     suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
     target_ids = tokenizer.encode(target, add_special_tokens=False)
 
@@ -349,7 +354,9 @@ class GCGAttack:
     def compute_prefix_cache(self, prompt: str) -> Any:
         """Precompute the key-value cache for the static prompt prefix tokens."""
         device = next(self.model.parameters()).device
-        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+        if self.tokenizer.eos_token_id is not None and len(prompt_ids) > 0 and prompt_ids[-1] == self.tokenizer.eos_token_id:
+            prompt_ids = prompt_ids[:-1]
         if not prompt_ids:
             return None
         input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
@@ -383,7 +390,7 @@ class GCGAttack:
             input_ids = inputs["input_ids"]
         else:
             input_ids = self.tokenizer.encode(
-                full_prompt, return_tensors="pt", add_special_tokens=False
+                full_prompt, return_tensors="pt", add_special_tokens=True
             ).to(device)
 
         output_ids = self.model.generate(
