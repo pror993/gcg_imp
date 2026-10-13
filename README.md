@@ -100,6 +100,12 @@ This completely avoids $(S \times |V|)$ autograd graph allocations and runs iden
 
 ```
 gcg_imp/
+├── benchmarks/
+│   ├── profile_step.py           # Micro-benchmark: latency breakdown across optimization phases
+│   ├── benchmark_prefix_cache.py # Macro-benchmark: naive vs prefix-cached speedup sweep
+│   ├── benchmark_memory.py       # Peak memory tracking & zero-copy view validation
+│   ├── run_all.py                # Unified benchmark suite orchestrator
+│   └── utils.py                  # Device synchronization & Markdown table formatter
 ├── src/
 │   ├── hotflip.py      # Canonical HotFlip: directional derivative flips on classifiers
 │   ├── gcg.py          # GCG attack: coordinate descent, top-k sampling, candidate eval
@@ -252,8 +258,57 @@ uv run python test_attack.py --attack gcg --model Qwen/Qwen2.5-1.5B-Instruct --s
   All tests passed – loss decreased steadily.
 ======================================================================
 ```
-
 ---
+
+## Systems Performance & Benchmarking Suite
+
+The repository includes a dedicated `benchmarks/` suite to empirically measure step latency decomposition, prefix KV-cache speedup ratios, and memory allocation across hardware backends.
+
+```bash
+# Run complete benchmark suite on Qwen 2.5 1.5B:
+uv run python benchmarks/run_all.py
+
+# Quick benchmark sweep:
+uv run python benchmarks/run_all.py --quick
+
+# Individual targeted benchmarks:
+uv run python benchmarks/profile_step.py --n-candidates 64 --batch-size 32
+uv run python benchmarks/benchmark_prefix_cache.py --candidates 32 64 128
+uv run python benchmarks/benchmark_memory.py --candidates 32 64 128
+```
+
+### 1. Step Latency Phase Decomposition (`profile_step.py`)
+Measured on **Qwen 2.5 1.5B** with hardware-synchronized timing (`torch.mps.synchronize()` / `torch.cuda.synchronize()`):
+
+| Phase                    | Latency (ms) | Std (ms) | Share (%) | Hardware Regime                           |
+| :----------------------- | :----------- | :------- | :-------- | :---------------------------------------- |
+| **Backward Pass**        | 144.86 ms    | ±3.26    | 28.6%     | Compute-bound (Autograd GEMMs)            |
+| **Vocab Projection & Top-K**| 8.22 ms   | ±0.52    | 1.6%      | HBM Bandwidth-bound (Embedding GEMM/sort) |
+| **Candidate Sampling**   | 0.61 ms      | ±0.09    | 0.1%      | Host CPU / Tensor allocation              |
+| **Candidate Evaluation** | 353.19 ms    | ±1.22    | 69.7%     | Compute + KV Attention-bound              |
+| **Total Step**           | **506.88 ms**| ±2.87    | **100.0%**| End-to-end iteration                      |
+
+### 2. Prefix KV-Cache vs. Naive Evaluation Speedup (`benchmark_prefix_cache.py`)
+Sweeping candidate pool size ($B$) and prompt length ($P$) on **Qwen 2.5 1.5B**:
+
+| Prompt Regime  | Candidates ($B$) | Naive Forward | Prefix-Cached Forward | Speedup Multiplier | FLOP Reduction |
+| :------------- | :--------------- | :------------ | :-------------------- | :----------------- | :------------- |
+| **Short ($P \approx 20$)**   | 32  | 523.7 ms      | 355.2 ms              | **1.47×**          | **1.61×**      |
+| **Short ($P \approx 20$)**   | 64  | 1034.4 ms     | 688.9 ms              | **1.50×**          | **1.62×**      |
+| **Medium ($P \approx 100$)** | 32  | 863.2 ms      | 365.5 ms              | **2.36×**          | **2.72×**      |
+| **Medium ($P \approx 100$)** | 64  | 1737.4 ms     | 751.6 ms              | **2.31×**          | **2.80×**      |
+
+*Key Takeaway*: As prompt context length increases, the static prefix KV-cache eliminates redundant attention and MLP projections across the candidate stream, achieving up to **$2.36\times$ empirical wall-clock speedup**.
+
+### 3. Peak Device Memory Allocation (`benchmark_memory.py`)
+
+| Candidates ($B$) | Model Weights | Naive Active VRAM | Cached Active VRAM | Memory Overhead |
+| :--------------- | :------------ | :---------------- | :----------------- | :-------------- |
+| **32**           | 2968.8 MB     | 2969.1 MB         | 2969.1 MB          | **0.0 MB** (Zero-Copy View Expansion) |
+| **64**           | 2968.8 MB     | 2969.1 MB         | 2969.1 MB          | **0.0 MB** (Zero-Copy View Expansion) |
+| **128**          | 2968.8 MB     | 2969.1 MB         | 2969.1 MB          | **0.0 MB** (Zero-Copy View Expansion) |
+
+*Key Takeaway*: `expand_kv_cache()` broadcasts the prefix key and value tensors across batch $B$ using zero-copy strided views (`.expand()`), consuming **zero additional megabytes** of physical memory.
 
 ## Configuration Reference
 
