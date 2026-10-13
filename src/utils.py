@@ -8,7 +8,9 @@ from transformers import PreTrainedTokenizerBase
 
 
 def get_device() -> torch.device:
-    """Return mps if available on Apple Silicon, else cpu."""
+    """Return cuda if available, mps if available on Apple Silicon, else cpu."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")

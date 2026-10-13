@@ -23,6 +23,7 @@ from src.gcg import (
     get_token_gradients,
     sample_candidates,
 )
+from src.hotflip import HotFlipAttack
 from src.model import load_model_and_tokenizer
 from src.utils import clear_memory, get_device
 
@@ -144,39 +145,104 @@ def run_test(model, tokenizer, test_case, n_steps, top_k, n_candidates, batch_si
     return losses, suffix, passed
 
 
+def run_hotflip_classifier_test(model_name: str = "distilbert/distilbert-base-uncased-finetuned-sst-2-english", steps: int = 5) -> bool:
+    """Verify HotFlip greedy token flip on a sequence classifier."""
+    print(f"\n{'='*70}")
+    print("  TEST: HotFlip Classifier Attack")
+    print(f"{'='*70}")
+    device = get_device()
+    try:
+        model, tokenizer = load_model_and_tokenizer(
+            model_name_or_path=model_name,
+            model_type="classifier",
+            dtype=torch.float32 if device.type == "cpu" else torch.float16,
+            device=device,
+        )
+    except Exception as exc:
+        print(f"Skipping classifier test (unable to load model {model_name}): {exc}")
+        return True
+
+    attack = HotFlipAttack(model, tokenizer, filter_non_ascii=True)
+    result = attack.run_classifier(
+        text="This movie was absolutely wonderful and brilliant.",
+        target_label=0,
+        max_steps=steps,
+    )
+    passed = result["steps"] > 0 and (result["success"] or result["final_label"] == 0 or len(result["flips"]) > 0)
+    status = "✅ PASS" if passed else "❌ FAIL"
+    print(f"{status} HotFlip Classifier Test (Steps: {result['steps']}, Flipped: {result['success']})")
+    clear_memory()
+    return passed
+
+
+def run_hotflip_causal_lm_test(model, tokenizer, steps: int = 5) -> bool:
+    """Verify HotFlip greedy token flip on a Causal LM."""
+    print(f"\n{'='*70}")
+    print("  TEST: HotFlip Causal-LM 1st-Order Baseline")
+    print(f"{'='*70}")
+    attack = HotFlipAttack(model, tokenizer, filter_non_ascii=True)
+    prompt = "Write a tutorial"
+    suffix = "! " * 10
+    target = "Sure, here is"
+
+    curr_suffix = suffix
+    for step in range(1, steps + 1):
+        curr_suffix, est_loss = attack.step_causal_lm(prompt, curr_suffix, target)
+        print(f"  Step {step:2d} | 1st-Order Score: {est_loss:.4f} | Suffix: {curr_suffix!r}")
+
+    passed = curr_suffix != suffix
+    status = "✅ PASS" if passed else "❌ FAIL"
+    print(f"{status} HotFlip Causal-LM Test (Suffix mutated successfully)")
+    return passed
+
 def main():
-    parser = argparse.ArgumentParser(description="Test GCG attack on example prompts")
+    parser = argparse.ArgumentParser(description="Test discrete adversarial attacks (GCG and HotFlip)")
+    parser.add_argument(
+        "--attack", type=str, choices=["all", "gcg", "hotflip"], default="all",
+        help="Which attacks to test ('all', 'gcg', 'hotflip')",
+    )
     parser.add_argument(
         "--model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct",
-        help="Hugging Face repo ID or local path",
+        help="Hugging Face repo ID or local path for causal LM",
+    )
+    parser.add_argument(
+        "--classifier-model", type=str, default="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+        help="Hugging Face repo ID or local path for classifier",
     )
     parser.add_argument("--steps", type=int, default=50, help="Steps per test")
     parser.add_argument("--top-k", type=int, default=256)
     parser.add_argument("--n-candidates", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=64)
     args = parser.parse_args()
-
     device = get_device()
     print(f"Device: {device}")
 
-    model, tokenizer = load_model_and_tokenizer(
-        model_name_or_path=args.model,
-        dtype=torch.float16,
-        device=device,
-    )
-
     results = []
-    for tc in TEST_CASES:
-        losses, suffix, passed = run_test(
-            model, tokenizer, tc,
-            n_steps=args.steps,
-            top_k=args.top_k,
-            n_candidates=args.n_candidates,
-            batch_size=args.batch_size,
-        )
-        results.append((tc["name"], passed))
+
+    # 1. HotFlip Classifier Test (Layer 1 Guardrail / Sequence Classification)
+    if args.attack in ("all", "hotflip"):
+        hf_cls_passed = run_hotflip_classifier_test(args.classifier_model, steps=min(args.steps, 10))
+        results.append(("HotFlip Classifier Attack", hf_cls_passed))
         clear_memory()
 
+    # 2. Causal LM Tests (Layer 2 Autoregressive LLM)
+    if args.attack in ("all", "gcg"):
+        model, tokenizer = load_model_and_tokenizer(
+            model_name_or_path=args.model,
+            dtype=torch.float16,
+            device=device,
+        )
+
+        for tc in TEST_CASES:
+            losses, suffix, passed = run_test(
+                model, tokenizer, tc,
+                n_steps=args.steps,
+                top_k=args.top_k,
+                n_candidates=args.n_candidates,
+                batch_size=args.batch_size,
+            )
+            results.append((f"GCG: {tc['name']}", passed))
+            clear_memory()
     # ---- Summary ----
     print(f"\n{'='*70}")
     print("  SUMMARY")

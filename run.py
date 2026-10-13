@@ -9,23 +9,44 @@ Usage
 """
 
 import argparse
+import time
 
 import torch
-
 from src.gcg import GCGAttack
+from src.hotflip import HotFlipAttack
 from src.model import load_model_and_tokenizer
 from src.utils import clear_memory, get_device
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run the GCG adversarial suffix attack"
+        description="Run discrete adversarial attacks (GCG or HotFlip) on Causal LMs or Classifiers"
+    )
+    parser.add_argument(
+        "--attack",
+        type=str,
+        choices=["gcg", "hotflip"],
+        default="gcg",
+        help="Attack algorithm: 'gcg' (coordinate descent + search) or 'hotflip' (1st-order greedy flip)",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["causal-lm", "classifier"],
+        default=None,
+        help="Target model architecture: 'classifier' (HotFlip) or 'causal-lm' (GCG). Defaults automatically based on --attack.",
     )
     parser.add_argument(
         "--model",
         type=str,
-        default="Qwen/Qwen2.5-1.5B-Instruct",
-        help="Hugging Face repo ID or path to local model directory",
+        default=None,
+        help="Hugging Face repo ID or path (default: Qwen 1.5B for causal-lm, DistilBERT-SST2 for classifier)",
+    )
+    parser.add_argument(
+        "--target-label",
+        type=int,
+        default=0,
+        help="Target class index for classifier attacks (e.g. 0 for NEGATIVE/UNSAFE)",
     )
     parser.add_argument(
         "--prompt",
@@ -94,36 +115,88 @@ def main():
         help="Disable static prefix KV caching during candidate evaluation",
     )
     args = parser.parse_args()
+    # Dynamically resolve model-type based on attack if not explicitly set
+    if args.model_type is None:
+        args.model_type = "classifier" if args.attack == "hotflip" else "causal-lm"
 
+    # Resolve default model based on model-type if not specified
+    if args.model is None:
+        if args.model_type == "classifier":
+            args.model = "distilbert/distilbert-base-uncased-finetuned-sst-2-english"
+        else:
+            args.model = "Qwen/Qwen2.5-1.5B-Instruct"
     device = get_device()
-    print(f"Device: {device}")
+    print(f"Device     : {device}")
+    print(f"Attack     : {args.attack.upper()}")
+    print(f"Model Type : {args.model_type}")
+    print(f"Model      : {args.model}")
 
-    # --- Load model & tokenizer ---
+    # --- Branch 1: Sequence Classifier Attack (HotFlip) ---
+    if args.model_type == "classifier":
+        model, tokenizer = load_model_and_tokenizer(
+            model_name_or_path=args.model,
+            model_type="classifier",
+            dtype=torch.float32 if device.type == "cpu" else torch.float16,
+            device=device,
+        )
+        attack = HotFlipAttack(
+            model,
+            tokenizer,
+            filter_non_ascii=not args.allow_non_ascii,
+        )
+        result = attack.run_classifier(
+            text=args.prompt,
+            target_label=args.target_label,
+            max_steps=args.steps,
+        )
+        print(f"\nFinal Result:")
+        print(f"  Success         : {result['success']}")
+        print(f"  Original Text   : {result['original_text']}")
+        print(f"  Perturbed Text  : {result['perturbed_text']}")
+        print(f"  Initial Class   : {result['initial_label']}")
+        print(f"  Final Class     : {result['final_label']}")
+        clear_memory()
+        return
+
+    # --- Branch 2: Causal LM Attack (GCG or HotFlip) ---
     model, tokenizer = load_model_and_tokenizer(
         model_name_or_path=args.model,
+        model_type="causal-lm",
         dtype=torch.float16,
         device=device,
     )
 
-    # --- Run GCG ---
-    attack = GCGAttack(
-        model,
-        tokenizer,
-        top_k=args.top_k,
-        n_candidates=args.n_candidates,
-        batch_size=args.batch_size,
-        filter_non_ascii=not args.allow_non_ascii,
-        use_prefix_cache=not args.no_prefix_cache,
-    )
-
-    optimised_suffix = attack.run(
-        prompt=args.prompt,
-        target=args.target,
-        suffix=args.suffix,
-        n_steps=args.steps,
-        use_chat_template=args.use_chat_template,
-    )
-
+    if args.attack == "gcg":
+        attack = GCGAttack(
+            model,
+            tokenizer,
+            top_k=args.top_k,
+            n_candidates=args.n_candidates,
+            batch_size=args.batch_size,
+            filter_non_ascii=not args.allow_non_ascii,
+            use_prefix_cache=not args.no_prefix_cache,
+        )
+        optimised_suffix = attack.run(
+            prompt=args.prompt,
+            target=args.target,
+            suffix=args.suffix,
+            n_steps=args.steps,
+            use_chat_template=args.use_chat_template,
+        )
+    else:  # hotflip on causal LM
+        attack = HotFlipAttack(
+            model,
+            tokenizer,
+            filter_non_ascii=not args.allow_non_ascii,
+        )
+        print("\nStarting HotFlip greedy suffix optimization (0 forward candidate evaluations)...")
+        suffix = args.suffix if args.suffix is not None else "! " * 20
+        for step in range(1, args.steps + 1):
+            t0 = time.perf_counter()
+            suffix, est_loss = attack.step_causal_lm(args.prompt, suffix, args.target)
+            step_ms = (time.perf_counter() - t0) * 1000
+            print(f"Step {step:2d} | 1st-Order Est Score: {est_loss:.4f} | Suffix: {suffix!r} ({step_ms:.1f}ms)")
+        optimised_suffix = suffix
     # --- Test the optimised suffix ---
     print(f"\n{'='*60}")
     print("Final test: generating with the optimised suffix")
