@@ -40,6 +40,8 @@ _CURRENT_RUN: Dict[str, Any] = {
     "final_response": "",
     "error_message": "",
     "elapsed": 0.0,
+    "prefix_cache": True,
+    "filter_non_ascii": True,
 }
 
 _STOP_REQUESTED = threading.Event()
@@ -117,6 +119,8 @@ def run_attack_worker(config: Dict[str, Any]) -> None:
     max_new_tokens = int(config.get("max_new_tokens", 32))
     early_stop = bool(config.get("early_stop", True))
     use_chat_template = bool(config.get("use_chat_template", False))
+    filter_non_ascii = bool(config.get("filter_non_ascii", True))
+    use_prefix_cache = bool(config.get("use_prefix_cache", True))
     with _STATE_LOCK:
         _CURRENT_RUN.update({
             "status": "loading",
@@ -130,6 +134,8 @@ def run_attack_worker(config: Dict[str, Any]) -> None:
             "final_response": "",
             "error_message": "",
             "elapsed": 0.0,
+            "prefix_cache": use_prefix_cache,
+            "filter_non_ascii": filter_non_ascii,
         })
 
     try:
@@ -141,12 +147,19 @@ def run_attack_worker(config: Dict[str, Any]) -> None:
             top_k=top_k,
             n_candidates=n_candidates,
             batch_size=batch_size,
+            filter_non_ascii=filter_non_ascii,
+            use_prefix_cache=use_prefix_cache,
         )
+
+        prefix_cache = attack.compute_prefix_cache(prompt) if attack.use_prefix_cache else None
 
         with _STATE_LOCK:
             _CURRENT_RUN["status"] = "running"
 
+        cache_str = "ON (1.5-3x speedup)" if use_prefix_cache else "OFF"
+        ascii_str = "ON (clean ASCII only)" if filter_non_ascii else "OFF"
         log_event(f"Starting GCG: {n_steps} steps, candidates={n_candidates}, top_k={top_k}")
+        log_event(f"Config: Prefix KV Cache = {cache_str} | Non-ASCII Filter = {ascii_str}")
 
         for step in range(1, n_steps + 1):
             if _STOP_REQUESTED.is_set():
@@ -156,7 +169,7 @@ def run_attack_worker(config: Dict[str, Any]) -> None:
                 break
 
             step_t0 = time.perf_counter()
-            suffix, loss = attack.step(prompt, suffix, target)
+            suffix, loss = attack.step(prompt, suffix, target, prefix_cache=prefix_cache)
             step_time = time.perf_counter() - step_t0
 
             with _STATE_LOCK:
@@ -405,19 +418,38 @@ HTML_PAGE = """<!DOCTYPE html>
               <input type="number" id="max_new_tokens" value="48">
               <p class="hint">Token limit for model generation during early-stop checks and final output. 32-64 is typical; increase to see longer completions.</p>
             </div>
-            <div style="display: flex; flex-direction: column; justify-content: center; gap: 6px; margin-top: 10px;">
-              <div style="display: flex; align-items: center;">
-                <input type="checkbox" id="early_stop" checked style="width: auto; margin-right: 6px; margin-bottom: 0;">
-                <label for="early_stop" style="margin-bottom: 0; cursor: pointer;">Early Stop</label>
-                <p class="hint" style="margin: 0 0 0 4px;">Stop when the model generates target prefix.</p>
+            <div>
+              <label>Prefix KV Cache</label>
+              <div style="display: flex; align-items: center; height: 38px;">
+                <input type="checkbox" id="use_prefix_cache" checked style="width: auto; margin-right: 8px; margin-bottom: 0;">
+                <label for="use_prefix_cache" style="margin-bottom: 0; cursor: pointer; color: var(--text-bright);">Enable Prefix KV Cache</label>
               </div>
-              <div style="display: flex; align-items: center;">
-                <input type="checkbox" id="use_chat_template" style="width: auto; margin-right: 6px; margin-bottom: 0;">
-                <label for="use_chat_template" style="margin-bottom: 0; cursor: pointer;">Chat Template</label>
-                <p class="hint" style="margin: 0 0 0 4px;">Wrap in chat template (off by default to match GCG optimization).</p>
-              </div>
+              <p class="hint">1.5x-3x faster forward passes via static prompt KV caching.</p>
             </div>
           </div>
+
+          <div class="row">
+            <div>
+              <div style="display: flex; align-items: center; height: 38px;">
+                <input type="checkbox" id="filter_non_ascii" checked style="width: auto; margin-right: 8px; margin-bottom: 0;">
+                <label for="filter_non_ascii" style="margin-bottom: 0; cursor: pointer; color: var(--text-bright);">Filter Non-ASCII Tokens</label>
+              </div>
+              <p class="hint">Exclude unprintable bytes, replacement characters, and special tokens.</p>
+            </div>
+            <div>
+              <div style="display: flex; align-items: center; height: 38px;">
+                <input type="checkbox" id="early_stop" checked style="width: auto; margin-right: 8px; margin-bottom: 0;">
+                <label for="early_stop" style="margin-bottom: 0; cursor: pointer; color: var(--text-bright);">Early Stopping</label>
+              </div>
+              <p class="hint">Halt as soon as greedy generation starts with the target string.</p>
+            </div>
+          </div>
+
+          <div style="display: flex; align-items: center; margin-top: 4px;">
+            <input type="checkbox" id="use_chat_template" style="width: auto; margin-right: 8px; margin-bottom: 0;">
+            <label for="use_chat_template" style="margin-bottom: 0; cursor: pointer; color: var(--text-bright);">Chat Template Wrapping</label>
+          </div>
+          <p class="hint" style="margin-bottom: 14px;">Apply chat template during evaluation and test generation (off by default to match GCG optimization).</p>
         </div>
       </div>
 
@@ -489,6 +521,18 @@ HTML_PAGE = """<!DOCTYPE html>
               <div id="mTime" class="metric-val">0s</div>
               <div class="metric-lbl">Elapsed</div>
             </div>
+          </div>
+
+          <div style="display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;">
+            <span style="font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 4px; background: rgba(88, 166, 255, 0.15); color: var(--accent); border: 1px solid rgba(88, 166, 255, 0.3);">
+              ✓ Monotonic Coordinate Descent (c₀)
+            </span>
+            <span id="badgeKVCache" style="font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 4px; background: rgba(63, 185, 80, 0.15); color: var(--success); border: 1px solid rgba(63, 185, 80, 0.3);">
+              ✓ Prefix KV Cache Active
+            </span>
+            <span id="badgeAscii" style="font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 4px; background: rgba(63, 185, 80, 0.15); color: var(--success); border: 1px solid rgba(63, 185, 80, 0.3);">
+              ✓ Non-ASCII Filter Active
+            </span>
           </div>
 
           <label>Target Loss Trajectory</label>
@@ -615,6 +659,8 @@ HTML_PAGE = """<!DOCTYPE html>
         max_new_tokens: parseInt(document.getElementById('max_new_tokens').value),
         early_stop: document.getElementById('early_stop').checked,
         use_chat_template: document.getElementById('use_chat_template').checked,
+        filter_non_ascii: document.getElementById('filter_non_ascii').checked,
+        use_prefix_cache: document.getElementById('use_prefix_cache').checked,
       };
 
       document.getElementById('btnRunAttack').disabled = true;
@@ -644,6 +690,39 @@ HTML_PAGE = """<!DOCTYPE html>
         badge.textContent = data.status.toUpperCase();
         badge.className = 'badge ' + data.status;
 
+
+        if (data.prefix_cache !== undefined) {
+          const bKV = document.getElementById('badgeKVCache');
+          if (bKV) {
+            if (data.prefix_cache) {
+              bKV.textContent = '✓ Prefix KV Cache Active';
+              bKV.style.color = 'var(--success)';
+              bKV.style.borderColor = 'rgba(63, 185, 80, 0.3)';
+              bKV.style.background = 'rgba(63, 185, 80, 0.15)';
+            } else {
+              bKV.textContent = '✗ Prefix KV Cache Off';
+              bKV.style.color = 'var(--muted)';
+              bKV.style.borderColor = 'var(--border)';
+              bKV.style.background = 'var(--box-bg)';
+            }
+          }
+        }
+        if (data.filter_non_ascii !== undefined) {
+          const bAscii = document.getElementById('badgeAscii');
+          if (bAscii) {
+            if (data.filter_non_ascii) {
+              bAscii.textContent = '✓ Non-ASCII Filter Active';
+              bAscii.style.color = 'var(--success)';
+              bAscii.style.borderColor = 'rgba(63, 185, 80, 0.3)';
+              bAscii.style.background = 'rgba(63, 185, 80, 0.15)';
+            } else {
+              bAscii.textContent = '✗ Non-ASCII Filter Off';
+              bAscii.style.color = 'var(--warning)';
+              bAscii.style.borderColor = 'rgba(210, 153, 34, 0.3)';
+              bAscii.style.background = 'rgba(210, 153, 34, 0.15)';
+            }
+          }
+        }
         const isBusy = data.status === 'running' || data.status === 'loading';
         document.getElementById('btnRunAttack').disabled = isBusy;
         document.getElementById('btnStopAttack').disabled = !isBusy;
