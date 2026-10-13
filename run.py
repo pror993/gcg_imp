@@ -87,6 +87,12 @@ def main():
         default=False,
         help="Allow non-ASCII and special tokens in candidate substitutions (disabled by default)",
     )
+    parser.add_argument(
+        "--no-prefix-cache",
+        action="store_true",
+        default=False,
+        help="Disable static prefix KV caching during candidate evaluation",
+    )
     args = parser.parse_args()
 
     device = get_device()
@@ -107,6 +113,7 @@ def main():
         n_candidates=args.n_candidates,
         batch_size=args.batch_size,
         filter_non_ascii=not args.allow_non_ascii,
+        use_prefix_cache=not args.no_prefix_cache,
     )
 
     optimised_suffix = attack.run(

@@ -85,6 +85,8 @@ def run_test(model, tokenizer, test_case, n_steps, top_k, n_candidates, batch_si
         batch_size=batch_size,
     )
 
+    prefix_cache = attack.compute_prefix_cache(prompt)
+
     # Run the attack without early stopping so we can observe the full
     # loss trajectory over all steps.
     print(f"\n{'Step':>6}  {'Loss':>8}  {'Time':>7}  Suffix")
@@ -103,7 +105,7 @@ def run_test(model, tokenizer, test_case, n_steps, top_k, n_candidates, batch_si
             n_candidates=n_candidates,
         )
         best_idx, best_loss = evaluate_candidates(
-            model, candidates, ts, batch_size=batch_size,
+            model, candidates, ts, batch_size=batch_size, prefix_cache=prefix_cache,
         )
 
         best_ids = candidates[best_idx]

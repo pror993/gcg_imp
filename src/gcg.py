@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Any, Tuple
 
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
-from src.utils import get_non_ascii_mask
+from src.utils import expand_kv_cache, get_non_ascii_mask
 
 
 # ---------------------------------------------------------------------------
@@ -222,18 +222,25 @@ def evaluate_candidates(
     candidates: torch.Tensor,
     token_slices: TokenSlices,
     batch_size: int = 64,
+    prefix_cache: Any = None,
 ) -> Tuple[int, float]:
     """Run a batched forward pass over candidates and return the best one.
+
+    When ``prefix_cache`` is provided (precomputed KV cache for the static prompt prefix),
+    the model only forwards candidate ``[suffix ‖ target]`` tokens, attending back to the
+    cached prefix representations. This eliminates redundant attention and MLP projections
+    over the prefix across all candidates.
 
     Parameters
     ----------
     model : PreTrainedModel
     candidates : Tensor (n_candidates, seq_len)
     token_slices : TokenSlices
-        Provides ``loss_slice`` and ``target_slice`` (index ranges are the
-        same for every candidate since sequence length is fixed).
+        Provides ``loss_slice`` and ``target_slice``.
     batch_size : int
         Process candidates in chunks to avoid OOM.
+    prefix_cache : DynamicCache or tuple, optional
+        Precomputed batch-1 KV cache for the static prompt prefix tokens.
 
     Returns
     -------
@@ -248,19 +255,47 @@ def evaluate_candidates(
 
     all_losses = []
 
-    for start in range(0, n_candidates, batch_size):
-        end = min(start + batch_size, n_candidates)
-        batch_ids = candidates[start:end].to(device)       # (B, seq_len)
+    if prefix_cache is not None:
+        p_len = token_slices.suffix_slice.start
+        s_len = token_slices.suffix_slice.stop - p_len
+        t_len = token_slices.target_slice.stop - token_slices.target_slice.start
+        # Suffix tokens are at [0, s_len); target tokens are at [s_len, s_len + t_len).
+        # Causal prediction: logit at (s_len - 1) predicts target token 0.
+        cache_loss_slice = slice(s_len - 1, s_len + t_len - 1)
 
-        logits = model(input_ids=batch_ids).logits          # (B, seq_len, vocab)
+        for start in range(0, n_candidates, batch_size):
+            end = min(start + batch_size, n_candidates)
+            cur_b = end - start
 
-        # Slice out the logits that predict target tokens.
-        loss_logits = logits[:, token_slices.loss_slice, :]  # (B, target_len, vocab)
+            # Forward only the mutable suffix and target tokens
+            batch_suffix_target = candidates[start:end, p_len:].to(device)
+            batch_kv = expand_kv_cache(prefix_cache, cur_b)
 
-        # Mean cross-entropy loss over target tokens per candidate.
-        targets = target_ids.unsqueeze(0).expand(batch_ids.size(0), -1)
-        loss = F.cross_entropy(loss_logits.transpose(1, 2), targets, reduction="none").mean(dim=1)
-        all_losses.append(loss)
+            logits = model(
+                input_ids=batch_suffix_target,
+                past_key_values=batch_kv,
+                use_cache=True,
+            ).logits
+
+            loss_logits = logits[:, cache_loss_slice, :]
+            targets = target_ids.unsqueeze(0).expand(cur_b, -1)
+            loss = F.cross_entropy(loss_logits.transpose(1, 2), targets, reduction="none").mean(dim=1)
+            all_losses.append(loss)
+    else:
+        for start in range(0, n_candidates, batch_size):
+            end = min(start + batch_size, n_candidates)
+            batch_ids = candidates[start:end].to(device)       # (B, seq_len)
+
+            logits = model(input_ids=batch_ids).logits          # (B, seq_len, vocab)
+
+            # Slice out the logits that predict target tokens.
+            loss_logits = logits[:, token_slices.loss_slice, :]  # (B, target_len, vocab)
+
+            # Mean cross-entropy loss over target tokens per candidate.
+            targets = target_ids.unsqueeze(0).expand(batch_ids.size(0), -1)
+            loss = F.cross_entropy(loss_logits.transpose(1, 2), targets, reduction="none").mean(dim=1)
+            all_losses.append(loss)
+
     all_losses = torch.cat(all_losses)                      # (n_candidates,)
     best_idx = all_losses.argmin().item()
     best_loss = all_losses[best_idx].item()
@@ -287,6 +322,7 @@ class GCGAttack:
         n_candidates: int = 256,
         batch_size: int = 64,
         filter_non_ascii: bool = True,
+        use_prefix_cache: bool = True,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -294,6 +330,7 @@ class GCGAttack:
         self.n_candidates = n_candidates
         self.batch_size = batch_size
         self.filter_non_ascii = filter_non_ascii
+        self.use_prefix_cache = use_prefix_cache
 
         # Freeze model weights so backward only computes gradients for input tokens.
         for p in self.model.parameters():
@@ -307,6 +344,17 @@ class GCGAttack:
             if self.filter_non_ascii
             else None
         )
+
+    @torch.no_grad()
+    def compute_prefix_cache(self, prompt: str) -> Any:
+        """Precompute the key-value cache for the static prompt prefix tokens."""
+        device = next(self.model.parameters()).device
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        if not prompt_ids:
+            return None
+        input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        out = self.model(input_ids=input_ids, use_cache=True)
+        return out.past_key_values
 
     # ---- helpers -----------------------------------------------------------
 
@@ -359,8 +407,12 @@ class GCGAttack:
         prompt: str,
         suffix: str,
         target: str,
+        prefix_cache: Any = None,
     ) -> Tuple[str, float]:
         """Execute one GCG iteration and return ``(updated_suffix, best_loss)``."""
+        if prefix_cache is None and self.use_prefix_cache:
+            prefix_cache = self.compute_prefix_cache(prompt)
+
         ts = find_token_slices(prompt, suffix, target, self.tokenizer)
         token_grads = get_token_gradients(self.model, ts, filter_mask=self.filter_mask)
         candidates = sample_candidates(
@@ -371,7 +423,11 @@ class GCGAttack:
             n_candidates=self.n_candidates,
         )
         best_idx, best_loss = evaluate_candidates(
-            self.model, candidates, ts, batch_size=self.batch_size,
+            self.model,
+            candidates,
+            ts,
+            batch_size=self.batch_size,
+            prefix_cache=prefix_cache,
         )
         suffix_ids = candidates[best_idx, ts.suffix_slice]
         new_suffix = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
@@ -420,9 +476,11 @@ class GCGAttack:
         print(f"{'Step':>6}  {'Loss':>8}  {'Time':>7}  Suffix")
         print(f"{'-'*6}  {'-'*8}  {'-'*7}  {'-'*40}")
 
+        prefix_cache = self.compute_prefix_cache(prompt) if self.use_prefix_cache else None
+
         for step_num in range(1, n_steps + 1):
             step_start = time.perf_counter()
-            suffix, best_loss = self.step(prompt, suffix, target)
+            suffix, best_loss = self.step(prompt, suffix, target, prefix_cache=prefix_cache)
             elapsed = time.perf_counter() - step_start
 
             print(f"{step_num:>4}/{n_steps:<2}  {best_loss:>8.4f}  {elapsed:>6.1f}s  {suffix!r}")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from transformers import PreTrainedTokenizerBase
 
@@ -62,3 +64,41 @@ def get_non_ascii_mask(
             mask[s_id] = True
 
     return mask
+
+
+def expand_kv_cache(past_key_values: Any, batch_size: int) -> Any:
+    """Expand precomputed batch-1 prefix KV cache to batch_size via non-copying views.
+
+    Parameters
+    ----------
+    past_key_values : DynamicCache or tuple
+        Precomputed key-value cache for the prompt prefix (batch dimension = 1).
+    batch_size : int
+        Target batch size for candidate forward passes.
+
+    Returns
+    -------
+    expanded_cache : DynamicCache or tuple
+        Cache expanded along the batch dimension.
+    """
+    if hasattr(past_key_values, "layers"):  # Transformers 5.x DynamicCache
+        from transformers.cache_utils import DynamicCache
+        new_cache = DynamicCache()
+        for layer_idx, layer in enumerate(past_key_values.layers):
+            k = layer.keys.expand(batch_size, -1, -1, -1)
+            v = layer.values.expand(batch_size, -1, -1, -1)
+            new_cache.update(k, v, layer_idx)
+        return new_cache
+    elif hasattr(past_key_values, "key_cache"):  # Transformers 4.x DynamicCache
+        from transformers.cache_utils import DynamicCache
+        new_cache = DynamicCache()
+        for k, v in zip(past_key_values.key_cache, past_key_values.value_cache):
+            new_cache.key_cache.append(k.expand(batch_size, -1, -1, -1))
+            new_cache.value_cache.append(v.expand(batch_size, -1, -1, -1))
+        return new_cache
+    elif isinstance(past_key_values, tuple):  # Legacy tuple of (key, value)
+        return tuple(
+            (k.expand(batch_size, -1, -1, -1), v.expand(batch_size, -1, -1, -1))
+            for k, v in past_key_values
+        )
+    return past_key_values
