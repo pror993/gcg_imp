@@ -73,22 +73,24 @@ $$\Delta \mathcal{L}_{i \to j} \approx \nabla_{e_i} \mathcal{L}^T (e_j - e_i) = 
 | Step | HotFlip True Loss (0 Candidate Eval Passes) | GCG True Loss (Batched Search + $c_0$) | Curvature Wall Phenomenon |
 | :--- | :--- | :--- | :--- |
 | **0** | **4.3438** | **4.3438** | Identical baseline prompt loss |
-| **1** | **4.5391** (↑) | **1.9668** (↓) | 1st-order gradient guess immediately climbs on HotFlip |
-| **2** | **4.8828** (↑) | **1.3242** (↓) | GCG drops -70%; HotFlip worsens |
-| **3** | **5.0820** (↑) | **1.2793** (↓) | HotFlip loss continues climbing |
-| **4** | **4.9023** (↓) | **1.2793** (=) | GCG holds lowest loss via $c_0$; HotFlip drops slightly |
-| **5** | **4.9023** (=) | **1.2793** (=) | HotFlip swaps token with zero loss drop; GCG holds bound |
-| **6** | **4.8828** (↓) | **1.2793** (=) | GCG maintains monotonic descent; HotFlip oscillates |
-| **7** | **2.0977** (↓) | **1.2793** (=) | HotFlip encounters temporary drop... |
-| **8** | **1.9180** (↓) | **1.2686** (↓) | GCG finds new lower-loss candidate |
-| **9** | **4.0469** (↑) | **1.2686** (=) | ...and HotFlip immediately spikes back up to 4.05 |
-| **10**| **4.2227** (↑) | **1.2686** (=) | **HotFlip fails (Net: -0.12); GCG jailbreaks (Net: -3.07 / -71%)** |
+| **1** | **4.5391** (↑) | **3.4980** (↓) | 1st-order gradient guess immediately climbs on HotFlip |
+| **2** | **4.8828** (↑) | **3.4121** (↓) | GCG steadily drops; HotFlip worsens |
+| **3** | **5.0820** (↑) | **1.8330** (↓) | GCG drops -46%; HotFlip loss peaks at 5.08 |
+| **4** | **4.9023** (↓) | **1.7861** (↓) | GCG continues monotonic descent |
+| **5** | **4.9023** (=) | **1.6338** (↓) | HotFlip swaps token with zero loss drop; GCG improves |
+| **6** | **4.8828** (↓) | **1.5674** (↓) | GCG drops smoothly; HotFlip remains stuck |
+| **7** | **2.1699** (↓) | **1.4990** (↓) | HotFlip finds temporary drop on newline token... |
+| **8** | **4.5586** (↑) | **1.4443** (↓) | ...and immediately spikes +2.39 as 1st-order guess fails |
+| **9** | **5.3203** (↑) | **1.4248** (↓) | HotFlip diverges further to 5.32 |
+| **10**| **5.4375** (↑) | **1.3721** (↓) | **HotFlip diverges (+1.09 worse); GCG jailbreaks (-68% drop)** |
+
+*BPE Invertibility Safeguard*: In `sample_candidates()`, every mutated candidate is checked to ensure `encode(decode(suffix)) == suffix_ids`. If token boundaries shift when decoded, the candidate is discarded, guaranteeing that the final text string reproduces the exact evaluated loss.
+
 ```bash
 # Reproduce HotFlip curvature breakdown live on Qwen 2.5 1.5B:
 uv run python run.py --attack hotflip --model-type causal-lm --model Qwen/Qwen2.5-1.5B-Instruct --steps 10
-# Output: Step 0 (4.34) -> Step 3 (5.08) -> Step 10 (4.22)
+# Output: Step 0 (4.34) -> Step 3 (5.08) -> Step 8 (4.56) -> Step 10 (5.44)
 ```
----
 
 ## Systems Engineering & Performance Optimizations
 

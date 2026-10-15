@@ -93,24 +93,13 @@ def run_test(model, tokenizer, test_case, n_steps, top_k, n_candidates, batch_si
     print(f"\n{'Step':>6}  {'Loss':>8}  {'Time':>7}  Suffix")
     print(f"{'-'*6}  {'-'*8}  {'-'*7}  {'-'*40}")
 
+    curr_suffix_ids = torch.tensor(tokenizer.encode(suffix, add_special_tokens=False), dtype=torch.long)
     for step in range(n_steps):
         step_start = time.perf_counter()
 
-        ts = find_token_slices(prompt, suffix, target, tokenizer)
-        token_grads = get_token_gradients(model, ts, filter_mask=attack.filter_mask)
-        candidates = sample_candidates(
-            current_ids=ts.input_ids,
-            token_gradients=token_grads,
-            suffix_slice=ts.suffix_slice,
-            top_k=top_k,
-            n_candidates=n_candidates,
+        suffix, best_loss, curr_suffix_ids = attack.step(
+            prompt, suffix, target, prefix_cache=prefix_cache, suffix_ids=curr_suffix_ids, return_ids=True
         )
-        best_idx, best_loss = evaluate_candidates(
-            model, candidates, ts, batch_size=batch_size, prefix_cache=prefix_cache,
-        )
-
-        best_ids = candidates[best_idx]
-        suffix = tokenizer.decode(best_ids[ts.suffix_slice], skip_special_tokens=True)
 
         elapsed = time.perf_counter() - step_start
         losses.append(best_loss)

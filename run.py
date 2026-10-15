@@ -192,21 +192,30 @@ def main():
         )
         print("\nStarting HotFlip greedy suffix optimization (0 forward candidate evaluations)...")
         suffix = args.suffix if args.suffix is not None else "! " * 20
-        ts_init = find_token_slices(args.prompt, suffix, args.target, tokenizer)
-        with torch.no_grad():
-            init_logits = model(input_ids=ts_init.input_ids.unsqueeze(0).to(device)).logits[0, ts_init.loss_slice, :]
-            init_loss = F.cross_entropy(init_logits, ts_init.input_ids[ts_init.target_slice].to(device)).item()
+        prompt_ids = tokenizer.encode(args.prompt, add_special_tokens=False)
+        curr_suffix_ids = torch.tensor(tokenizer.encode(suffix, add_special_tokens=False), dtype=torch.long)
+        target_ids = tokenizer.encode(args.target, add_special_tokens=False)
+
+        def eval_curr_loss(s_ids):
+            eval_full = torch.tensor([prompt_ids + s_ids.tolist() + target_ids], dtype=torch.long, device=device)
+            p_len = len(prompt_ids)
+            s_len = len(s_ids)
+            t_len = len(target_ids)
+            with torch.no_grad():
+                step_logits = model(input_ids=eval_full).logits[0, slice(p_len + s_len - 1, p_len + s_len + t_len - 1), :]
+                return F.cross_entropy(step_logits, eval_full[0, slice(p_len + s_len, p_len + s_len + t_len)]).item()
+
+        init_loss = eval_curr_loss(curr_suffix_ids)
         print(f"Step  0 | True Loss: {init_loss:.4f} | Suffix: {suffix!r}")
 
         for step in range(1, args.steps + 1):
             t0 = time.perf_counter()
-            suffix, est_loss = attack.step_causal_lm(args.prompt, suffix, args.target)
+            suffix, est_loss, curr_suffix_ids = attack.step_causal_lm(
+                args.prompt, suffix, args.target, suffix_ids=curr_suffix_ids, return_ids=True
+            )
             step_ms = (time.perf_counter() - t0) * 1000
-            ts = find_token_slices(args.prompt, suffix, args.target, tokenizer)
-            with torch.no_grad():
-                step_logits = model(input_ids=ts.input_ids.unsqueeze(0).to(device)).logits[0, ts.loss_slice, :]
-                true_loss = F.cross_entropy(step_logits, ts.input_ids[ts.target_slice].to(device)).item()
-            print(f"Step {step:2d} | True Loss: {true_loss:.4f} | Est Score: {est_loss:.4f} | Suffix: {suffix!r} ({step_ms:.1f}ms)")
+            true_loss = eval_curr_loss(curr_suffix_ids)
+            print(f"Step {step:2d} | True Loss: {true_loss:.4f} | Est Delta: {est_loss:.4f} | Suffix: {suffix!r} ({step_ms:.1f}ms)")
         optimised_suffix = suffix
     print(f"\n{'='*60}")
     print("Final test: generating with the optimised suffix")

@@ -279,37 +279,56 @@ class HotFlipAttack:
         prompt: str,
         suffix: str,
         target: str,
-    ) -> Tuple[str, float]:
+        suffix_ids: torch.Tensor | None = None,
+        return_ids: bool = False,
+    ) -> Tuple[str, float] | Tuple[str, float, torch.Tensor]:
         """Perform one 1st-order greedy HotFlip step on a causal LM suffix.
 
         Unlike GCG, which samples candidates and evaluates batched forward passes,
         HotFlip directly swaps the single suffix token with the steepest
         first-order gradient projection score (0 candidate forward passes).
         """
-        from src.gcg import find_token_slices, get_token_gradients
+        from src.gcg import TokenSlices, find_token_slices, get_token_gradients
 
-        ts = find_token_slices(prompt, suffix, target, self.tokenizer)
+        device = next(self.model.parameters()).device
+        if suffix_ids is not None:
+            prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            target_ids = self.tokenizer.encode(target, add_special_tokens=False)
+            p_len = len(prompt_ids)
+            s_len = len(suffix_ids)
+            t_len = len(target_ids)
+            full_ids = torch.tensor(prompt_ids + suffix_ids.tolist() + target_ids, dtype=torch.long)
+            ts = TokenSlices(
+                input_ids=full_ids,
+                suffix_slice=slice(p_len, p_len + s_len),
+                target_slice=slice(p_len + s_len, p_len + s_len + t_len),
+                loss_slice=slice(p_len + s_len - 1, p_len + s_len + t_len - 1),
+            )
+            s_ids = suffix_ids.to(device)
+        else:
+            ts = find_token_slices(prompt, suffix, target, self.tokenizer)
+            s_ids = ts.input_ids[ts.suffix_slice].to(device)
+
         token_grads = get_token_gradients(self.model, ts, filter_mask=self.filter_mask)
-        device = token_grads.device
-        suffix_ids = ts.input_ids[ts.suffix_slice].to(device)
-        suffix_len = suffix_ids.shape[0]
+        suffix_len = s_ids.shape[0]
 
         # Baseline subtraction: Delta L ~ <grad_i, e_j - e_{x_i}>
-        current_scores = token_grads[torch.arange(suffix_len, device=device), suffix_ids].unsqueeze(1)
+        current_scores = token_grads[torch.arange(suffix_len, device=device), s_ids].unsqueeze(1)
         delta_scores = token_grads - current_scores
 
         # Mask current tokens: j != x_i (force an actual token substitution)
-        delta_scores[torch.arange(suffix_len, device=device), suffix_ids] = float("inf")
+        delta_scores[torch.arange(suffix_len, device=device), s_ids] = float("inf")
 
         flat_argmin = delta_scores.argmin().item()
         vocab_size = token_grads.shape[1]
         best_suffix_pos = flat_argmin // vocab_size
         best_new_token = flat_argmin % vocab_size
 
-        # Apply greedy substitution
-        new_suffix_ids = suffix_ids.clone()
+        new_suffix_ids = s_ids.clone()
         new_suffix_ids[best_suffix_pos] = best_new_token
 
         new_suffix = self.tokenizer.decode(new_suffix_ids, skip_special_tokens=True)
         est_delta = delta_scores[best_suffix_pos, best_new_token].item()
+        if return_ids:
+            return new_suffix, est_delta, new_suffix_ids.cpu()
         return new_suffix, est_delta

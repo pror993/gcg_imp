@@ -170,6 +170,7 @@ def sample_candidates(
     suffix_slice: slice,
     top_k: int = 256,
     n_candidates: int = 256,
+    tokenizer: PreTrainedTokenizerBase | None = None,
 ) -> torch.Tensor:
     """Sample candidate suffix replacements using top-k gradient info.
 
@@ -215,9 +216,18 @@ def sample_candidates(
 
         # Mutate selected positions in-place for candidates 1 to N-1
         candidates[1 + torch.arange(n_mutations, device=device), rand_pos + suffix_slice.start] = replacements
+
+    # BPE invertibility check: guarantee every candidate inverts cleanly between token IDs and text
+    if tokenizer is not None and n_mutations > 0:
+        for b in range(1, n_candidates):
+            cand_suffix_ids = candidates[b, suffix_slice].tolist()
+            decoded_suffix = tokenizer.decode(cand_suffix_ids, skip_special_tokens=True)
+            re_encoded_ids = tokenizer.encode(decoded_suffix, add_special_tokens=False)
+            if cand_suffix_ids != re_encoded_ids:
+                # Revert to identity candidate 0 if BPE boundary collapses
+                candidates[b] = candidates[0]
+
     return candidates
-
-
 # ---------------------------------------------------------------------------
 # Step 4 – Evaluate candidates and pick the best
 # ---------------------------------------------------------------------------
@@ -445,6 +455,7 @@ class GCGAttack:
             suffix_slice=ts.suffix_slice,
             top_k=self.top_k,
             n_candidates=self.n_candidates,
+            tokenizer=self.tokenizer,
         )
         best_idx, best_loss = evaluate_candidates(
             self.model,
