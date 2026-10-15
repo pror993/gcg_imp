@@ -89,6 +89,9 @@ def get_classifier_gradients(
     # First-order Taylor approximation: Delta L = <grad, e_j> - <grad, e_{x_i}>
     delta_loss = proj - current_proj
 
+    # Mask self-tokens: HotFlip must replace x_i with a different token (j != x_i)
+    delta_loss[torch.arange(ids.shape[0], device=device), ids] = float("inf")
+
     if filter_mask is not None:
         delta_loss[:, filter_mask.to(device)] = float("inf")
 
@@ -230,37 +233,41 @@ class HotFlipAttack:
 
         for step in range(1, max_steps + 1):
             t0 = time.perf_counter()
-            current_ids, pred, loss_val, (pos, old_tok, new_tok) = self.step_classifier(
+            current_ids, _, _, (pos, old_tok, new_tok) = self.step_classifier(
                 current_ids, target_label
             )
             step_time = (time.perf_counter() - t0) * 1000
 
+            # Evaluate post-flip prediction and loss
+            with torch.no_grad():
+                post_logits = self.model(current_ids.unsqueeze(0)).logits[0]
+                target_tensor = torch.tensor([target_label], dtype=torch.long, device=device)
+                post_loss = F.cross_entropy(post_logits.unsqueeze(0), target_tensor).item()
+                post_pred = post_logits.argmax().item()
+
             old_str = self.tokenizer.decode([old_tok])
             new_str = self.tokenizer.decode([new_tok])
-            current_label_name = id2label.get(pred, str(pred))
+            post_label_name = id2label.get(post_pred, str(post_pred))
 
             print(
-                f"Step {step:2d} | Loss: {loss_val:.4f} | Pred: {current_label_name} "
+                f"Step {step:2d} | Post-Loss: {post_loss:.4f} | Pred: {post_label_name} "
                 f"| Flip @ {pos}: {old_str!r} -> {new_str!r} ({step_time:.1f}ms)"
             )
             flips.append((pos, old_str, new_str))
 
-            # Check if prediction flipped
-            with torch.no_grad():
-                check_logits = self.model(current_ids.unsqueeze(0)).logits[0]
-                check_pred = check_logits.argmax().item()
-                if check_pred == target_label:
-                    print(f"\n[Success] Classification flipped to {target_label_name} at step {step}!")
-                    success = True
-                    break
+            if post_pred == target_label:
+                print(f"\n[Success] Classification flipped to {target_label_name} at step {step}!")
+                success = True
+                break
 
         perturbed_text = self.tokenizer.decode(current_ids, skip_special_tokens=True)
+        final_label = post_pred if 'post_pred' in locals() else init_pred
         return {
             "success": success,
             "original_text": text,
             "perturbed_text": perturbed_text,
             "initial_label": init_pred,
-            "final_label": check_pred if 'check_pred' in locals() else pred,
+            "final_label": final_label,
             "flips": flips,
             "steps": len(flips),
         }
@@ -283,17 +290,26 @@ class HotFlipAttack:
 
         ts = find_token_slices(prompt, suffix, target, self.tokenizer)
         token_grads = get_token_gradients(self.model, ts, filter_mask=self.filter_mask)
+        device = token_grads.device
+        suffix_ids = ts.input_ids[ts.suffix_slice].to(device)
+        suffix_len = suffix_ids.shape[0]
 
-        # token_grads is (suffix_len, vocab_size). Lower = more negative = steepest descent.
-        flat_argmin = token_grads.argmin().item()
+        # Baseline subtraction: Delta L ~ <grad_i, e_j - e_{x_i}>
+        current_scores = token_grads[torch.arange(suffix_len, device=device), suffix_ids].unsqueeze(1)
+        delta_scores = token_grads - current_scores
+
+        # Mask current tokens: j != x_i (force an actual token substitution)
+        delta_scores[torch.arange(suffix_len, device=device), suffix_ids] = float("inf")
+
+        flat_argmin = delta_scores.argmin().item()
         vocab_size = token_grads.shape[1]
         best_suffix_pos = flat_argmin // vocab_size
         best_new_token = flat_argmin % vocab_size
 
         # Apply greedy substitution
-        suffix_ids = ts.input_ids[ts.suffix_slice].clone()
-        suffix_ids[best_suffix_pos] = best_new_token
+        new_suffix_ids = suffix_ids.clone()
+        new_suffix_ids[best_suffix_pos] = best_new_token
 
-        new_suffix = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
-        est_loss = token_grads[best_suffix_pos, best_new_token].item()
-        return new_suffix, est_loss
+        new_suffix = self.tokenizer.decode(new_suffix_ids, skip_special_tokens=True)
+        est_delta = delta_scores[best_suffix_pos, best_new_token].item()
+        return new_suffix, est_delta

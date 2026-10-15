@@ -415,12 +415,29 @@ class GCGAttack:
         suffix: str,
         target: str,
         prefix_cache: Any = None,
-    ) -> Tuple[str, float]:
+        suffix_ids: torch.Tensor | None = None,
+        return_ids: bool = False,
+    ) -> Tuple[str, float] | Tuple[str, float, torch.Tensor]:
         """Execute one GCG iteration and return ``(updated_suffix, best_loss)``."""
         if prefix_cache is None and self.use_prefix_cache:
             prefix_cache = self.compute_prefix_cache(prompt)
 
-        ts = find_token_slices(prompt, suffix, target, self.tokenizer)
+        if suffix_ids is not None:
+            prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            target_ids = self.tokenizer.encode(target, add_special_tokens=False)
+            p_len = len(prompt_ids)
+            s_len = len(suffix_ids)
+            t_len = len(target_ids)
+            full_ids = torch.tensor(prompt_ids + suffix_ids.tolist() + target_ids, dtype=torch.long)
+            ts = TokenSlices(
+                input_ids=full_ids,
+                suffix_slice=slice(p_len, p_len + s_len),
+                target_slice=slice(p_len + s_len, p_len + s_len + t_len),
+                loss_slice=slice(p_len + s_len - 1, p_len + s_len + t_len - 1),
+            )
+        else:
+            ts = find_token_slices(prompt, suffix, target, self.tokenizer)
+
         token_grads = get_token_gradients(self.model, ts, filter_mask=self.filter_mask)
         candidates = sample_candidates(
             current_ids=ts.input_ids,
@@ -436,10 +453,11 @@ class GCGAttack:
             batch_size=self.batch_size,
             prefix_cache=prefix_cache,
         )
-        suffix_ids = candidates[best_idx, ts.suffix_slice]
-        new_suffix = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
+        winner_suffix_ids = candidates[best_idx, ts.suffix_slice].cpu()
+        new_suffix = self.tokenizer.decode(winner_suffix_ids, skip_special_tokens=True)
+        if return_ids:
+            return new_suffix, best_loss, winner_suffix_ids
         return new_suffix, best_loss
-
     def run(
         self,
         prompt: str,
@@ -484,10 +502,13 @@ class GCGAttack:
         print(f"{'-'*6}  {'-'*8}  {'-'*7}  {'-'*40}")
 
         prefix_cache = self.compute_prefix_cache(prompt) if self.use_prefix_cache else None
+        curr_suffix_ids = torch.tensor(self.tokenizer.encode(suffix, add_special_tokens=False), dtype=torch.long)
 
         for step_num in range(1, n_steps + 1):
             step_start = time.perf_counter()
-            suffix, best_loss = self.step(prompt, suffix, target, prefix_cache=prefix_cache)
+            suffix, best_loss, curr_suffix_ids = self.step(
+                prompt, suffix, target, prefix_cache=prefix_cache, suffix_ids=curr_suffix_ids, return_ids=True
+            )
             elapsed = time.perf_counter() - step_start
 
             print(f"{step_num:>4}/{n_steps:<2}  {best_loss:>8.4f}  {elapsed:>6.1f}s  {suffix!r}")

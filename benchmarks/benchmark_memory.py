@@ -17,12 +17,10 @@ from typing import List
 # Ensure repository root is in sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
-
 from benchmarks.utils import format_markdown_table, get_allocated_memory_mb, sync_device
 from src.gcg import evaluate_candidates, find_token_slices
 from src.model import load_model_and_tokenizer
 from src.utils import clear_memory, get_device
-
 
 def measure_peak_memory(
     model,
@@ -31,29 +29,39 @@ def measure_peak_memory(
     batch_size: int,
     prefix_cache=None,
 ) -> float:
-    """Run candidate evaluation and track peak device memory in Megabytes."""
+    """Measure peak in-flight device memory in Megabytes during forward passes."""
+    device = next(model.parameters()).device
     clear_memory()
     sync_device()
-    mem_before = get_allocated_memory_mb()
 
-    # Execute candidate evaluation
-    evaluate_candidates(
-        model,
-        candidates,
-        token_slices,
-        batch_size=batch_size,
-        prefix_cache=prefix_cache,
-    )
-    sync_device()
-    mem_after = get_allocated_memory_mb()
+    p_len = token_slices.suffix_slice.start
+    cur_b = min(batch_size, candidates.shape[0])
 
-    # If backend supports peak memory tracking directly (CUDA)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    if prefix_cache is not None:
+        batch_suffix_target = candidates[:cur_b, p_len:].to(device)
+        from src.utils import expand_kv_cache
+        batch_kv = expand_kv_cache(prefix_cache, cur_b)
+        with torch.no_grad():
+            out = model(input_ids=batch_suffix_target, past_key_values=batch_kv, use_cache=True)
+            sync_device()
+            peak_mb = get_allocated_memory_mb()
+            del out, batch_kv, batch_suffix_target
+    else:
+        batch_full = candidates[:cur_b].to(device)
+        with torch.no_grad():
+            out = model(input_ids=batch_full)
+            sync_device()
+            peak_mb = get_allocated_memory_mb()
+            del out, batch_full
+
     if torch.cuda.is_available():
         peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-        torch.cuda.reset_peak_memory_stats()
-        return peak_mb
 
-    return max(mem_before, mem_after)
+    clear_memory()
+    return peak_mb
 
 
 def main():
