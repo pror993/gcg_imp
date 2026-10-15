@@ -12,7 +12,8 @@ import argparse
 import time
 
 import torch
-from src.gcg import GCGAttack
+import torch.nn.functional as F
+from src.gcg import GCGAttack, find_token_slices
 from src.hotflip import HotFlipAttack
 from src.model import load_model_and_tokenizer
 from src.utils import clear_memory, get_device
@@ -191,13 +192,22 @@ def main():
         )
         print("\nStarting HotFlip greedy suffix optimization (0 forward candidate evaluations)...")
         suffix = args.suffix if args.suffix is not None else "! " * 20
+        ts_init = find_token_slices(args.prompt, suffix, args.target, tokenizer)
+        with torch.no_grad():
+            init_logits = model(input_ids=ts_init.input_ids.unsqueeze(0).to(device)).logits[0, ts_init.loss_slice, :]
+            init_loss = F.cross_entropy(init_logits, ts_init.input_ids[ts_init.target_slice].to(device)).item()
+        print(f"Step  0 | True Loss: {init_loss:.4f} | Suffix: {suffix!r}")
+
         for step in range(1, args.steps + 1):
             t0 = time.perf_counter()
             suffix, est_loss = attack.step_causal_lm(args.prompt, suffix, args.target)
             step_ms = (time.perf_counter() - t0) * 1000
-            print(f"Step {step:2d} | 1st-Order Est Score: {est_loss:.4f} | Suffix: {suffix!r} ({step_ms:.1f}ms)")
+            ts = find_token_slices(args.prompt, suffix, args.target, tokenizer)
+            with torch.no_grad():
+                step_logits = model(input_ids=ts.input_ids.unsqueeze(0).to(device)).logits[0, ts.loss_slice, :]
+                true_loss = F.cross_entropy(step_logits, ts.input_ids[ts.target_slice].to(device)).item()
+            print(f"Step {step:2d} | True Loss: {true_loss:.4f} | Est Score: {est_loss:.4f} | Suffix: {suffix!r} ({step_ms:.1f}ms)")
         optimised_suffix = suffix
-    # --- Test the optimised suffix ---
     print(f"\n{'='*60}")
     print("Final test: generating with the optimised suffix")
     print(f"{'='*60}")
