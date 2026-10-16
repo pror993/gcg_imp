@@ -1,5 +1,7 @@
 # Discrete Adversarial Optimization Engine: HotFlip & GCG
 
+> **What this project does:** Modern AI apps use two layers of defense: a fast classifier filter (Layer 1) and an aligned language model (Layer 2). This engine stress-tests both layers by using model gradients to automatically find exact word or token swaps that bypass filters (**HotFlip**) or force specific model responses (**GCG**)—optimized with custom Key-Value (KV) caching to run **2.4× faster** on consumer GPUs and Apple Silicon.
+
 A high-throughput, from-scratch implementation of discrete gradient-based adversarial optimization for language models, unifying canonical **HotFlip** (Ebrahimi et al., ACL 2018) and **Greedy Coordinate Gradient (GCG)** (Zou et al., 2023).
 
 Engineered to evaluate the two-tier defense architecture of modern LLM deployments:
